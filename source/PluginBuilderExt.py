@@ -540,7 +540,6 @@ class PluginBuilderExt:
 			self._log('Build', f"  - CMakeLists:    {self.CMakeListsPath} (EXISTS)")
 			self._log('Build', f"  - Executing:     {self.cmake_build_cmd}")
 			self.SendCommand(self.cmake_build_cmd)
-			run("args[0].ext.PluginBuilderExt.sync_custom_parameters(verbose=True)", self.ownerComp, delayFrames=15)
 		else:
 			self._log('Build', f"SKIPPED — no CMakeLists.txt found at {self.CMakeListsPath}")
 
@@ -557,7 +556,6 @@ class PluginBuilderExt:
 			self._log('Compile', f"  - Build Output:  {self.build_path}")
 			self._log('Compile', f"  - Executing:     {self.cmake_build_plugin_cmd}")
 			self.SendCommand(self.cmake_build_plugin_cmd)
-			run("args[0].ext.PluginBuilderExt.sync_custom_parameters(verbose=True)", self.ownerComp, delayFrames=15)
 		else:
 			self._log('Compile', "SKIPPED — no CMakeLists.txt found")
 

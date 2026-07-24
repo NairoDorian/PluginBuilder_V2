@@ -51,6 +51,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ---
 
+### 🐛 Fixed
+
+- **Eliminated Duplicate `[ParamSync]` Telemetry Log Output**: Removed premature `sync_custom_parameters()` calls in `compile_plugin()` and `build_plugin()`, guaranteeing parameter sync fires strictly once after the C++ DLL is copied and reloaded.
+
+---
+
 ### 🛡️ Technical Specifications & Compatibility Matrix
 
 | Feature | TouchDesigner Compatibility | Toolchain | Operating System |
