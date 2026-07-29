@@ -135,24 +135,18 @@ PluginBuilder_V2/
 
 ---
 
-## 6. Comprehensive Pass 2 Improvement Plan
+---
+
+## 6. Completed Improvement Roadmap & Status
 
 > [!NOTE]  
-> **Status:** Pass 2 Plan created and audited. **No code changes have been executed yet.**
+> **Status:** All Pass 1 and Pass 2 improvements, bug fixes, dead-code removals, and comprehensive explanatory documentation have been **fully executed, verified, committed, and pushed.**
 
-### Phase 1: Template Standardization & Metadata Substitution Fix
-- Update `FillDATPluginInfo()` in `templates/BasicDAT/source/BasicDAT.cpp` to use standard metadata placeholders (`#__OP_TYPE__#`, `#__OP_LABEL__#`, `#__OP_ICON__#`, `#__OP_AUTHOR__#`, `#__OP_EMAIL__#`).
+### Completed Milestones
+- **Multi-Vector Tuple Parameter Binding**: Supported in `PluginBuilderExt.py` across all vector dimensions (`XYZ`, `RGB`, `RGBA`, `UV`, `Float` tuple size `N`).
+- **Template Placeholder Standardization**: `BasicDAT.cpp` updated with standard placeholders (`#__OP_TYPE__#`, `#__OP_LABEL__#`, `#__OP_ICON__#`, `#__OP_AUTHOR__#`, `#__OP_EMAIL__#`).
+- **Safe Header Metadata Parsing**: `eval()` replaced with `ast.literal_eval()`.
+- **Windows File Lock Detection**: Exception handling expanded to `(PermissionError, OSError)`.
+- **Automated Source File Tracking**: `CONFIGURE_DEPENDS` added to CMake `file(GLOB_RECURSE ...)` in `CMakeBlocks.py`.
+- **Tooling & Settings Documentation**: Full docstrings and explanatory inline comments added to `CMakeBlocks.py`, `dev/deploy.py`, `dev/settings_template.ini`, and `PluginBuilderExt.py`.
 
-### Phase 2: Extension Logic & Custom Parameter Inspection
-- Update `sync_custom_parameters()` in `source/PluginBuilderExt.py` to check `getattr(p, 'isCustom', False)` alongside casing filters.
-- Remove dead code statement (`self.loader_op = self.loader_op`) in `create_plugin_loader()`.
-
-### Phase 3: Developer Tooling & Settings Cleanup
-- Refactor `dev/deploy.py` to use `PluginBuilderComp.EnableCreatePars()`.
-- Update `dev/settings_template.ini` default path to `${USER_PATH}/PluginBuilder`.
-- Update CUDA runtime comments in `source/CMakeBlocks.py`.
-
-### Development (`dev/`)
-- **`dev.toe`**: Interactive development sandbox file.
-- **`deploy.py`**: Helper script to package and export `PluginBuilder.tox`.
-- **`settings_template.ini`**: Initial configuration template for environment setup.

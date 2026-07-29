@@ -1,3 +1,16 @@
+"""
+CMakeBlocks.py — Modular CMakeLists.txt Template Assembler for PluginBuilder_V2
+
+This module defines string templates used by PluginBuilderExt.py to dynamically
+assemble a complete CMakeLists.txt file for new C++ TouchDesigner custom operators.
+
+Template Placeholders:
+  __PLUGIN_TYPE__        : 'CHOP', 'TOP', 'DAT', or 'SOP' (header comment for auto-detection)
+  __PLUGIN_NAME__        : Name of the C++ plugin project (e.g. 'MyCustomCHOP')
+  __PLUGIN_BUILDER_DIR__ : Absolute path to the PluginBuilder installation directory
+"""
+
+# Header comment & minimum CMake version configuration
 start_block = '''# {'plugin_type': __PLUGIN_TYPE__}
 cmake_minimum_required (VERSION 3.21)
 
