@@ -530,6 +530,19 @@ class PluginBuilderExt:
 		if not os.path.exists(self.abs_working_dir):
 			raise FileNotFoundError(f"Directory {self.abs_working_dir} does not exist.")
 
+		# Clean stale build cache if generator mismatched or non-Ninja cache detected
+		build_dir = os.path.join(self.abs_working_dir, 'build')
+		cache_file = os.path.join(build_dir, 'CMakeCache.txt')
+		if os.path.exists(cache_file):
+			try:
+				with open(cache_file, 'r', encoding='utf-8', errors='ignore') as f:
+					content = f.read()
+					if 'CMAKE_GENERATOR:INTERNAL=' in content and 'Ninja' not in content:
+						self._log('Build', "Detected non-Ninja CMake generator cache. Cleaning build directory...")
+						shutil.rmtree(build_dir, ignore_errors=True)
+			except Exception as e:
+				self._log('Build', f"Warning inspecting CMakeCache.txt: {e}")
+
 		if self.CMakeListsExists:
 			self._log('Build', "=========================================================")
 			self._log('Build', f"STARTING CMAKE CONFIGURE FOR PLUGIN: '{self.Pluginname}'")
@@ -830,7 +843,35 @@ class PluginBuilderExt:
 		existing = getattr(target_comp.par, par_name, None)
 		existing_page_name = getattr(getattr(existing, 'page', None), 'name', '') if existing is not None else ''
 
-		# Create parameter dynamically if missing or not on target page
+		# Detect style/type mismatch between existing parameter and C++ loader parameter
+		if existing is not None:
+			src_style = getattr(loader_par, 'style', '')
+			dst_style = getattr(existing, 'style', '')
+
+			src_is_menu = getattr(loader_par, 'isMenu', False) or src_style in ('Menu', 'StrMenu', 'IntMenu')
+			dst_is_menu = getattr(existing, 'isMenu', False) or dst_style in ('Menu', 'StrMenu', 'IntMenu')
+
+			src_is_float = getattr(loader_par, 'isFloat', False) or src_style == 'Float'
+			dst_is_float = getattr(existing, 'isFloat', False) or dst_style == 'Float'
+
+			src_is_int = getattr(loader_par, 'isInt', False) or src_style == 'Int'
+			dst_is_int = getattr(existing, 'isInt', False) or dst_style == 'Int'
+
+			src_is_toggle = getattr(loader_par, 'isToggle', False) or src_style == 'Toggle'
+			dst_is_toggle = getattr(existing, 'isToggle', False) or dst_style == 'Toggle'
+
+			if (src_is_menu != dst_is_menu or
+				src_is_float != dst_is_float or
+				src_is_int != dst_is_int or
+				is_pulse != (getattr(existing, 'isPulse', False) or dst_style == 'Pulse') or
+				src_is_toggle != dst_is_toggle):
+				try:
+					existing.destroy()
+				except Exception:
+					pass
+				existing = None
+
+		# Create parameter dynamically if missing, mismatched type, or not on target page
 		if existing is None or existing_page_name != page.name:
 			try:
 				if getattr(loader_par, 'isFloat', False) or style == 'Float':
@@ -939,14 +980,6 @@ class PluginBuilderExt:
 		except Exception:
 			pass
 
-		# If force_rebuild is requested, clear existing custom parameters on page first
-		if force_rebuild and page and hasattr(page, 'pars'):
-			for p_custom in list(page.pars):
-				try:
-					p_custom.destroy()
-				except Exception:
-					pass
-
 		# Built-in parameters of CPlusPlus OPs to exclude
 		built_in_pars = {
 			'unloadplugin', 'plugin', 'reinit', 'reinitpulse',
@@ -972,6 +1005,17 @@ class PluginBuilderExt:
 				if p.name not in seen_names:
 					seen_names.add(p.name)
 					loader_custom_pars.append(p)
+
+		current_page_par_names = [p_custom.name for p_custom in getattr(page, 'pars', [])]
+		expected_par_names = [p.name for p in loader_custom_pars]
+
+		# If force_rebuild is requested OR if parameter order/names mismatch, clean page first to preserve exact C++ declaration order
+		if (force_rebuild or current_page_par_names != expected_par_names) and page and hasattr(page, 'pars'):
+			for p_custom in list(page.pars):
+				try:
+					p_custom.destroy()
+				except Exception:
+					pass
 
 		loader_par_names = {p.name for p in loader_custom_pars}
 
@@ -1210,7 +1254,7 @@ class PluginBuilderExt:
 				self.loader_op.par.reinitpulse.pulse()
 			self.loader_op.cook(force=True)
 			self._log('Build→Copy', f"Plugin reloaded from {plugin_path}")
-			run("args[0].ext.PluginBuilderExt.sync_custom_parameters(verbose=True)", self.ownerComp, delayFrames=15)
+			run("args[0].ext.PluginBuilderExt.sync_custom_parameters(force_rebuild=True, verbose=True)", self.ownerComp, delayFrames=15)
 		else:
 			self._log('Build→Copy', f"ERROR: Copy failed, {plugin_path} does not exist after copy.")
 
