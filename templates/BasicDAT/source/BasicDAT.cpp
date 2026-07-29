@@ -34,20 +34,20 @@ FillDATPluginInfo(DAT_PluginInfo *info)
 	// Always return DAT_CPLUSPLUS_API_VERSION in this function.
 	info->apiVersion = DATCPlusPlusAPIVersion;
 
-	// The opType is the unique name for this TOP. It must start with a
+	// The opType is the unique name for this DAT. It must start with a
 	// capital A-Z character, and all the following characters must lower case
 	// or numbers (a-z, 0-9)
-	info->customOPInfo.opType->setString("Customdat");
+	info->customOPInfo.opType->setString("#__OP_TYPE__#");
 
 	// The opLabel is the text that will show up in the OP Create Dialog
-	info->customOPInfo.opLabel->setString("Custom DAT");
+	info->customOPInfo.opLabel->setString("#__OP_LABEL__#");
 
 	// Will be turned into a 3 letter icon on the nodes
-	info->customOPInfo.opIcon->setString("CDT");
+	info->customOPInfo.opIcon->setString("#__OP_ICON__#");
 
 	// Information about the author of this OP
-	info->customOPInfo.authorName->setString("Author Name");
-	info->customOPInfo.authorEmail->setString("email@email.com");
+	info->customOPInfo.authorName->setString("#__OP_AUTHOR__#");
+	info->customOPInfo.authorEmail->setString("#__OP_EMAIL__#");
 
 	// This DAT works with 0 or 1 inputs
 	info->customOPInfo.minInputs = 0;

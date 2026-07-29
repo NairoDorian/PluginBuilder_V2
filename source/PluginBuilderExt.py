@@ -28,6 +28,7 @@ import subprocess
 import threading
 import queue
 import json
+import ast
 
 import CMakeBlocks
 
@@ -497,11 +498,9 @@ class PluginBuilderExt:
 		# Configure loader — start unloaded, set plugin path
 		self.loader_op.par.unloadplugin = True
 		self.loader_op.par.plugin = f"{self.plugin_dir}/{self.Pluginname}.dll"
-		self.loader_op = self.loader_op
 
 		# Schedule custom parameter sync after loader initialization
 		run("args[0].ext.PluginBuilderExt.sync_custom_parameters()", self.ownerComp, delayFrames=15)
-		pass
 
 	# ---------------- CMake Assembly ---------------------------------------------------------- #
 
@@ -754,10 +753,10 @@ class PluginBuilderExt:
 		try:
 			with open(filepath, 'rb', buffering=0):
 				pass
-		except PermissionError:
-			return True   # File is locked by another process
 		except FileNotFoundError:
 			return False  # File doesn't exist — not "locked"
+		except (PermissionError, OSError):
+			return True   # File is locked by another process
 		return False
 
 	# ========================================================================================== #
@@ -797,20 +796,23 @@ class PluginBuilderExt:
 					pass
 		if hasattr(src_p, 'menuNames') and hasattr(dst_p, 'menuNames'):
 			try:
+				if hasattr(src_p, 'menuLabels') and hasattr(dst_p, 'menuLabels'):
+					dst_p.menuLabels = src_p.menuLabels
 				dst_p.menuNames = src_p.menuNames
 			except Exception:
-				pass
-		if hasattr(src_p, 'menuLabels') and hasattr(dst_p, 'menuLabels'):
-			try:
-				dst_p.menuLabels = src_p.menuLabels
-			except Exception:
-				pass
+				try:
+					dst_p.menuNames = src_p.menuNames
+					if hasattr(src_p, 'menuLabels') and hasattr(dst_p, 'menuLabels'):
+						dst_p.menuLabels = src_p.menuLabels
+				except Exception:
+					pass
 
 	def _sync_single_parameter(self, loader_par, page, target_comp):
 		"""Dynamically mirror a single parameter from loader_par onto target_comp's page.
 
 		Adapts to newly created, renamed, or modified parameters by inspecting
-		parameter style, size, bounds, menus, bindings, and enablement.
+		parameter style, size, bounds, menus, bindings, and enablement across all
+		tuple components.
 		"""
 		par_name = loader_par.name
 		label = getattr(loader_par, 'label', par_name)
@@ -832,66 +834,82 @@ class PluginBuilderExt:
 		if existing is None or existing_page_name != page.name:
 			try:
 				if getattr(loader_par, 'isFloat', False) or style == 'Float':
-					new_p = page.appendFloat(par_name, label=label, size=size)[0]
+					res = page.appendFloat(par_name, label=label, size=size)
 				elif getattr(loader_par, 'isInt', False) or style == 'Int':
-					new_p = page.appendInt(par_name, label=label, size=size)[0]
+					res = page.appendInt(par_name, label=label, size=size)
 				elif getattr(loader_par, 'isToggle', False) or style == 'Toggle':
-					new_p = page.appendToggle(par_name, label=label, size=size)[0]
+					res = page.appendToggle(par_name, label=label, size=size)
 				elif getattr(loader_par, 'isMenu', False) or style in ('Menu', 'StrMenu', 'IntMenu'):
 					try:
-						new_p = page.appendMenu(par_name, label=label)[0]
+						res = page.appendMenu(par_name, label=label)
 					except Exception:
-						new_p = page.appendStr(par_name, label=label)[0]
+						res = page.appendStr(par_name, label=label)
 				elif is_pulse:
-					new_p = page.appendPulse(par_name, label=label)[0]
+					res = page.appendPulse(par_name, label=label)
 				elif getattr(loader_par, 'isStr', False) or getattr(loader_par, 'isString', False) or style in ('Str', 'String'):
-					new_p = page.appendStr(par_name, label=label)[0]
+					res = page.appendStr(par_name, label=label)
 				elif getattr(loader_par, 'isHeader', False) or style == 'Header':
-					new_p = page.appendHeader(par_name, label=label)[0]
+					res = page.appendHeader(par_name, label=label)
 				elif style == 'XYZ':
-					new_p = page.appendXYZ(par_name, label=label)[0]
+					res = page.appendXYZ(par_name, label=label)
 				elif style == 'UV':
-					new_p = page.appendUV(par_name, label=label)[0]
+					res = page.appendUV(par_name, label=label)
 				elif style == 'RGB':
-					new_p = page.appendRGB(par_name, label=label)[0]
+					res = page.appendRGB(par_name, label=label)
 				elif style == 'RGBA':
-					new_p = page.appendRGBA(par_name, label=label)[0]
+					res = page.appendRGBA(par_name, label=label)
 				else:
 					try:
-						new_p = page.appendStr(par_name, label=label)[0]
+						res = page.appendStr(par_name, label=label)
 					except Exception:
-						new_p = page.appendPar(par_name, label=label)[0]
+						res = page.appendPar(par_name, label=label)
 
-				existing = new_p
+				if isinstance(res, (list, tuple)):
+					existing = res[0]
+				else:
+					existing = res
 			except Exception as e:
 				self._log('ParamSync', f"  ERROR creating dynamic parameter '{par_name}': {e}")
 				return None
 
-		if existing is not None:
-			self._copy_par_attributes(loader_par, existing)
-			default_val = repr(getattr(loader_par, 'default', 0))
-			safe_bind = f"me.op('{self.loader_op.name}').par.{par_name} if me.op('{self.loader_op.name}') is not None else {default_val}"
+		# Collect destination tuple elements and source tuple elements
+		if hasattr(existing, 'tuple') and existing.tuple:
+			dst_pars = list(existing.tuple)
+		else:
+			dst_pars = [existing]
 
-			try:
-				existing.enable = getattr(loader_par, 'enable', True)
-				existing.readOnly = getattr(loader_par, 'readOnly', False)
-				if is_pulse:
-					if hasattr(existing, 'bindExpr'):
-						existing.bindExpr = ''
-				else:
-					if hasattr(existing, 'bindExpr'):
-						existing.bindExpr = safe_bind
-					try:
-						if hasattr(td, 'ParMode'):
-							existing.mode = td.ParMode.BIND
-					except Exception:
-						pass
-					if hasattr(loader_par, 'val'):
-						existing.val = loader_par.val
-					elif hasattr(loader_par, 'eval'):
-						existing.val = loader_par.eval()
-			except Exception:
-				pass
+		if hasattr(loader_par, 'tuple') and loader_par.tuple:
+			src_pars = list(loader_par.tuple)
+		else:
+			src_pars = [loader_par]
+
+		# Process attribute copying and binding across all vector components
+		for src_p, dst_p in zip(src_pars, dst_pars):
+			if dst_p is not None:
+				self._copy_par_attributes(src_p, dst_p)
+				default_val = repr(getattr(src_p, 'default', 0))
+				safe_bind = f"me.op('{self.loader_op.name}').par.{dst_p.name} if me.op('{self.loader_op.name}') is not None else {default_val}"
+
+				try:
+					dst_p.enable = getattr(src_p, 'enable', True)
+					dst_p.readOnly = getattr(src_p, 'readOnly', False)
+					if is_pulse:
+						if hasattr(dst_p, 'bindExpr'):
+							dst_p.bindExpr = ''
+					else:
+						if hasattr(dst_p, 'bindExpr'):
+							dst_p.bindExpr = safe_bind
+						try:
+							if hasattr(td, 'ParMode'):
+								dst_p.mode = td.ParMode.BIND
+						except Exception:
+							pass
+						if hasattr(src_p, 'val'):
+							dst_p.val = src_p.val
+						elif hasattr(src_p, 'eval'):
+							dst_p.val = src_p.eval()
+				except Exception:
+					pass
 
 		return existing
 
@@ -949,7 +967,8 @@ class PluginBuilderExt:
 
 		for p in all_pars:
 			par_name = p.name.lower()
-			if p.name and p.name[0].isupper() and par_name not in built_in_pars:
+			is_custom_par = getattr(p, 'isCustom', False) or (p.name and p.name[0].isupper())
+			if is_custom_par and par_name not in built_in_pars:
 				if p.name not in seen_names:
 					seen_names.add(p.name)
 					loader_custom_pars.append(p)
@@ -1045,10 +1064,10 @@ class PluginBuilderExt:
 			if first_line.startswith('#'):
 				info = None
 				try:
-					info = eval(first_line[2:])
-				except:
+					info = ast.literal_eval(first_line[2:].strip())
+				except Exception:
 					pass
-				if info is not None:
+				if info is not None and isinstance(info, dict):
 					plugin_type = info.get('plugin_type')
 					if plugin_type is not None:
 						self._log('Init', f"Loading existing PluginProject: '{self.Pluginname}' (type={plugin_type})")

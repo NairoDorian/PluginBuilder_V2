@@ -58,7 +58,7 @@ set(INCLUDE_DIR "${PLUGIN_BUILDER_DIR}/include")
 message(STATUS "INCLUDE_DIR: ${INCLUDE_DIR}")
 
 # Collect all source files and exclude gtest files.
-file(GLOB_RECURSE PROJ_SOURCE_FILES 
+file(GLOB_RECURSE PROJ_SOURCE_FILES CONFIGURE_DEPENDS
 "${SOURCE_DIR}/*.cpp" "${SOURCE_DIR}/*.c" "${SOURCE_DIR}/*.cu" "${SOURCE_DIR}/*.h" "${SOURCE_DIR}/*.cuh")
 
 add_library(__PLUGIN_NAME__ SHARED ${PROJ_SOURCE_FILES})
@@ -87,7 +87,7 @@ target_include_directories(__PLUGIN_NAME__ PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 target_link_libraries(__PLUGIN_NAME__ PRIVATE CUDA::cudart)
 
 # Post-build command to copy the CUDA runtime DLL to the output directory
-# set(cuda_runtime_dll "${CUDAToolkit_BIN_DIR}/cudart64_110.dll")
+# set(cuda_runtime_dll "${CUDAToolkit_BIN_DIR}/cudart64_118.dll")
 # add_custom_command(TARGET __PLUGIN_NAME__ POST_BUILD
 #   COMMAND ${CMAKE_COMMAND} -E copy_if_different
 #   ${cuda_runtime_dll} $<TARGET_FILE_DIR:__PLUGIN_NAME__>)
