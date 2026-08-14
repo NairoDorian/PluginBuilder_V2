@@ -771,11 +771,12 @@ enum class AttribType : int32_t
 	Int,
 };
 
-// Right now we only support point attributes.
 enum class AttribSet : int32_t
 {
 	Invalid,
 	Point = 0,
+	Vertex,
+	Primitive,
 };
 
 // The type of the primitives, currently only Polygon type
@@ -1332,16 +1333,16 @@ public:
 	// Returns an array of point positions. This array is getNumPoints() long.
 	virtual const Position*	getPointPositions() const = 0;
 
-	// Returns an array of normals.
+	// Returns an array of point normals.
 	//
 	// Returns nullptr if no normals are present
 	virtual const SOP_NormalInfo* 	getNormals() const = 0;
 
-	// Returns an array of colors.
+	// Returns an array of point colors.
 	// Returns nullptr if no colors are present
 	virtual const SOP_ColorInfo* 	getColors() const = 0;
 
-	// Returns an array of texture coordinates.
+	// Returns an array of point texture coordinates.
 	// If multiple texture coordinate layers are present, they will be placed
 	// interleaved back-to-back.
 	// E.g layer0 followed by layer1 followed by layer0 etc.
@@ -1355,11 +1356,11 @@ public:
 	// Returns the custom attribute data with its name
 	virtual const SOP_CustomAttribData*	getCustomAttribute(const char* customAttribName) const = 0;
 
-	// Returns true if the SOP has a normal attribute of the given source
+	// Returns true if the SOP has a normal point attribute of the given source
 	// attribute 'N'
 	virtual bool			hasNormals() const = 0;
 
-	// Returns true if the SOP has a color the given source
+	// Returns true if the SOP has a color point attribute of the given source
 	// attribute 'Cd'
 	virtual bool			hasColors() const = 0;
 
@@ -1372,7 +1373,7 @@ public:
 								float &hitU, float &hitV, int &hitPrimitiveIndex) = 0;
 
 	// Returns the SOP_PrimitiveInfo with primIndex
-	const SOP_PrimitiveInfo
+	const SOP_PrimitiveInfo&
 	getPrimitive(int32_t primIndex) const
 	{
 		return myPrimsInfo[primIndex];
@@ -1385,6 +1386,30 @@ public:
 	{
 		return myPrimPointIndices;
 	}
+
+	// Returns an array of vertex colors.
+	// Returns nullptr if no colors are present
+	virtual const SOP_ColorInfo* getVtxColors() const = 0;
+
+	// Returns an array of vertex texture coordinates.
+	// If multiple texture coordinate layers are present, they will be placed
+	// interleaved back-to-back.
+	// E.g layer0 followed by layer1 followed by layer0 etc.
+	//
+	// Returns nullptr if no texture layers are present
+	virtual const SOP_TextureInfo* getVtxTextures() const = 0;
+
+	// Returns an array of primitive colors.
+	// Returns nullptr if no colors are present
+	virtual const SOP_ColorInfo* getPrimColors() const = 0;
+
+	// Returns true if the SOP has a color vertex attribute of the given source
+// attribute 'Cd'
+	virtual bool			hasVtxColors() const = 0;
+
+	// Returns true if the SOP has a color primitive attribute of the given source
+	// attribute 'Cd'
+	virtual bool			hasPrimColors() const = 0;
 
 	SOP_PrimitiveInfo*		myPrimsInfo;
 	const int32_t*			myPrimPointIndices;

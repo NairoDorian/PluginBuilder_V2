@@ -131,7 +131,7 @@ public:
 	uint32_t		startIndex;
 
 	// Specify the sample rate of the channel data
-	// DEFAULT : whatever the timeline FPS is ($FPS)
+	// DEFAULT : whatever the component timeline FPS is. (me.time.rate)
 	float			sampleRate;
 
 	void*			reserved1;
@@ -404,4 +404,5 @@ static_assert(offsetof(CHOP_Output, names) == 16, "Incorrect Alignment");
 static_assert(offsetof(CHOP_Output, channels) == 24, "Incorrect Alignment");
 static_assert(sizeof(CHOP_Output) == 112, "Incorrect Size");
 }; // namespace TD
+
 #endif
