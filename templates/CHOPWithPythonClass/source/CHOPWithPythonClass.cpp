@@ -18,6 +18,17 @@
 #include <string.h>
 #include <cmath>
 #include <assert.h>
+
+// Python Notes:
+// There are a few things needed that make this project work with Python.
+// First, the Python header files need to be found. These are already added to the
+// include path for this Sample's project. If adding to another project you'll need
+// to copy those include paths to your own project, or point the project to your
+// own copies of the include files, if you dont want to use the ones
+// shipped with TouchDesigner.
+// Similarly, the library search paths need to be setup in the linking phase.
+// As with the includes, you can use the ones in this Sample project,
+// or point the project to your own Python library location.
 #ifdef _WIN32
 	#include <Python.h>
 	#include <structmember.h>
@@ -40,7 +51,7 @@ pyReset(PyObject* self)
 	if (inst)
 	{
 		inst->resetFilter();
-		// Make the node dirty so it will cook an output a newly reset filter when asked next
+		// Make the node dirty so it will cook and output a newly reset filter when asked next
 		me->context->makeNodeDirty();
 	}
 
@@ -166,9 +177,10 @@ void
 FillCHOPPluginInfo(CHOP_PluginInfo *info)
 {
 	// Always set this to CHOPCPlusPlusAPIVersion.
-	info->apiVersion = CHOPCPlusPlusAPIVersion;
+	if (!info->setAPIVersion(CHOPCPlusPlusAPIVersion))
+		return;
 
-	// The opType is the unique name for this BasicCHOP. It must start with a 
+	// The opType is the unique name for this CHOP. It must start with a 
 	// capital A-Z character, and all the following characters must lower case
 	// or numbers (a-z, 0-9)
 	info->customOPInfo.opType->setString("#__OP_TYPE__#");
@@ -182,12 +194,15 @@ FillCHOPPluginInfo(CHOP_PluginInfo *info)
 	// Information about the author of this OP
 	info->customOPInfo.authorName->setString("#__OP_AUTHOR__#");
 	info->customOPInfo.authorEmail->setString("#__OP_EMAIL__#");
-	
+
 	// This CHOP can work with 0 inputs
 	info->customOPInfo.minInputs = 0;
 
 	// It can accept up to 1 input though, which changes it's behavior
 	info->customOPInfo.maxInputs = 1;
+
+	// Custom website URL that the Operator Help can point to
+	info->customOPInfo.opHelpURL->setString("#__OP_HELPURL__#");
 
 	info->customOPInfo.pythonVersion->setString(PY_VERSION);
 	info->customOPInfo.pythonMethods = methods;

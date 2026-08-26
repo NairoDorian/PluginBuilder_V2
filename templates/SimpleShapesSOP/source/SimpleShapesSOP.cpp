@@ -26,52 +26,56 @@
 extern "C"
 {
 
-DLLEXPORT
-void
-FillSOPPluginInfo(SOP_PluginInfo *info)
-{
-	// Always return SOP_CPLUSPLUS_API_VERSION in this function.
-	info->apiVersion = SOPCPlusPlusAPIVersion;
+	DLLEXPORT
+	void
+	FillSOPPluginInfo(SOP_PluginInfo *info)
+	{
+		// Check to make sure the running TD version supports our API version.
+		if (!info->setAPIVersion(SOPCPlusPlusAPIVersion))
+			return;
 
-	// The opType is the unique name for this BasicCHOP. It must start with a 
-	// capital A-Z character, and all the following characters must lower case
-	// or numbers (a-z, 0-9)
-	info->customOPInfo.opType->setString("#__OP_TYPE__#");
+		// The opType is the unique name for this TOP. It must start with a 
+		// capital A-Z character, and all the following characters must lower case
+		// or numbers (a-z, 0-9)
+		info->customOPInfo.opType->setString("#__OP_TYPE__#");
 
-	// The opLabel is the text that will show up in the OP Create Dialog
-	info->customOPInfo.opLabel->setString("#__OP_LABEL__#");
+		// The opLabel is the text that will show up in the OP Create Dialog
+		info->customOPInfo.opLabel->setString("#__OP_LABEL__#");
 
-	// Will be turned into a 3 letter icon on the nodes
-	info->customOPInfo.opIcon->setString("#__OP_ICON__#");
+		// Will be turned into a 3 letter icon on the nodes
+		info->customOPInfo.opIcon->setString("#__OP_ICON__#");
 
-	// Information about the author of this OP
-	info->customOPInfo.authorName->setString("#__OP_AUTHOR__#");
-	info->customOPInfo.authorEmail->setString("#__OP_EMAIL__#");
+		// Information about the author of this OP
+		info->customOPInfo.authorName->setString("#__OP_AUTHOR__#");
+		info->customOPInfo.authorEmail->setString("#__OP_EMAIL__#");
 
-	// This SOP works with 0 or 1 inputs
-	info->customOPInfo.minInputs = 0;
-	info->customOPInfo.maxInputs = 1;
+		// This SOP works with 0 or 1 inputs
+		info->customOPInfo.minInputs = 0;
+		info->customOPInfo.maxInputs = 1;
 
-}
+		// Custom website URL that the Operator Help can point to
+		info->customOPInfo.opHelpURL->setString("#__OP_HELPURL__#");
 
-DLLEXPORT
-SOP_CPlusPlusBase*
-CreateSOPInstance(const OP_NodeInfo* info)
-{
-	// Return a new instance of your class every time this is called.
-	// It will be called once per SOP that is using the .dll
-	return new SimpleShapesSOP(info);
-}
+	}
 
-DLLEXPORT
-void
-DestroySOPInstance(SOP_CPlusPlusBase* instance)
-{
-	// Delete the instance here, this will be called when
-	// Touch is shutting down, when the SOP using that instance is deleted, or
-	// if the SOP loads a different DLL
-	delete (SimpleShapesSOP*)instance;
-}
+	DLLEXPORT
+	SOP_CPlusPlusBase*
+	CreateSOPInstance(const OP_NodeInfo* info)
+	{
+		// Return a new instance of your class every time this is called.
+		// It will be called once per SOP that is using the .dll
+		return new SimpleShapesSOP(info);
+	}
+
+	DLLEXPORT
+	void
+	DestroySOPInstance(SOP_CPlusPlusBase* instance)
+	{
+		// Delete the instance here, this will be called when
+		// Touch is shutting down, when the SOP using that instance is deleted, or
+		// if the SOP loads a different DLL
+		delete (SimpleShapesSOP*)instance;
+	}
 
 };
 
@@ -565,19 +569,20 @@ fillFaceVBO(SOP_VBOOutput* output,
 	int k = 0;
 	while (k < VertSz * 3)
 	{
-		*(vertOut++) = inVert[k] * scale;
+		if (vertOut)
+			*(vertOut++) = inVert[k] * scale;
 
-		if (output->hasNormal())
+		if (output->hasNormal() && normalOut)
 		{
 			*(normalOut++) = inNormal[k];
 		}
 
-		if (output->hasColor())
+		if (output->hasColor() && colorOut)
 		{
 			*(colorOut++) = inColor[k];
 		}
 
-		if (output->hasTexCoord())
+		if (output->hasTexCoord() && texCoordOut)
 		{
 			for (int t = 0; t < numTexLayers +1; t++)
 			{
@@ -618,19 +623,20 @@ fillLineVBO(SOP_VBOOutput* output,
 	int k = 0;
 	while (k < vertSz)
 	{
-		*(vertOut++) = inVert[k];
+		if (vertOut && inVert)
+			*(vertOut++) = inVert[k];
 
-		if (output->hasNormal())
+		if (output->hasNormal() && normalOut)
 		{
 			*(normalOut++) = inNormal[k];
 		}
 
-		if (output->hasColor())
+		if (output->hasColor() && colorOut)
 		{
 			*(colorOut++) = inColor[k];
 		}
 
-		if (output->hasTexCoord())
+		if (output->hasTexCoord() && texCoordOut)
 		{
 			for (int t = 0; t < numTexLayers + 1; t++)
 			{
@@ -672,19 +678,20 @@ fillParticleVBO(SOP_VBOOutput* output,
 	int k = 0;
 	while (k < vertSz)
 	{
-		*(vertOut++) = inVert[k];
+		if (vertOut)
+			*(vertOut++) = inVert[k];
 
-		if (output->hasNormal())
+		if (output->hasNormal() && normalOut)
 		{
 			*(normalOut++) = inNormal[k];
 		}
 
-		if (output->hasColor())
+		if (output->hasColor() && colorOut)
 		{
 			*(colorOut++) = inColor[k];
 		}
 
-		if (output->hasTexCoord())
+		if (output->hasTexCoord() && texCoordOut)
 		{
 			for (int t = 0; t < numTexLayers + 1; t++)
 			{

@@ -1,65 +1,72 @@
 # Changelog — PluginBuilder_V2
 
-All notable changes to the `PluginBuilder_V2` framework are documented in this file.
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+---
+
+## [2.1.0] - 2026-08-26
+
+### SDK
+- **C++ API 10 headers** (CHOP 10 / TOP 12 / SOP 4 / DAT 4 / POP 1, Common 2) synced from TouchDesigner
+  2025.33070 `Samples/CPlusPlus` by the new `dev/sync_templates.py`; `include/sdk_versions.json` records what is
+  vendored and the extension warns at init when the running TouchDesigner ships different versions.
+  (2.0.0 claimed a "2026.20000 SDK sync" but still carried the API-9 headers.)
+- All templates regenerated from the installed samples with `setAPIVersion()`, `opHelpURL` and metadata placeholders;
+  **new POP templates** `SimpleShapesPOP` and `CudaPOP`. Templates are described by `templates/<Name>/template.json`
+  and discovered at runtime (the template menu is populated from them).
+
+### Build system
+- **`cmake/TDPlugin.cmake`** shared module (`td_add_plugin`, `td_plugin_optimize`, `td_plugin_use_fftw3/cuda/python/opencv`,
+  `td_plugin_add_runtime_dll`, `td_plugin_add_test`, `td_plugin_add_bench`) + `cmake/TDDeploy.cmake`
+  (rename-in-place deploy for standalone builds). Generated `CMakeLists.txt` is 15 lines and includes the module,
+  so fixes reach existing projects on their next configure.
+- `-DPLUGIN_BUILDER_DIR` / `-DPLUGIN_DIR` passed by PluginBuilder are honoured (2.0.0 baked absolute paths with
+  `CACHE … FORCE`, silently ignoring both). `PLUGIN_BUILDER_DIR` can also come from the environment.
+- `compile_commands.json` exported on every configure; `/Zi` only for Debug/RelWithDebInfo, `/INCREMENTAL:NO` for
+  Release; `_USE_MATH_DEFINES`, `/utf-8`, `/Zc:__cplusplus`, optional `/W4 /permissive-` (`TD_PLUGIN_WARNINGS`)
+  and `/fsanitize=address` (`TD_PLUGIN_ASAN`); CUDA architectures 75…120; explicit `python3xx.lib` link.
+- `plugin.json` manifest per project (family, optype, template, features, API versions); the legacy
+  `# {'plugin_type': …}` header is still written and read.
+
+### Extension (`source/PluginBuilderExt.py`, `source/PluginBuilderCore.py`)
+- **Build runner with exit codes**: `vcvarsall` is captured once into an environment, cmake/ninja/ctest run as
+  individual jobs inside a Windows job object (children die with the runner), output is drained on the main thread,
+  and every job reports success/failure and duration. Compiler/linker/CMake/Ninja diagnostics are parsed into
+  `builder/build_errors` and surfaced as COMP errors; new **Status** page (`Build Status`, `Last Build`,
+  `Loaded DLL`, `Cancel Build`, `Clean Build Dir`, `Force Reload Plugin`, `Run Tests`).
+- **Hot reload without an unload gap**: the built DLL is hashed (no reload when unchanged), the loaded DLL is
+  renamed to `.old` and the new one copied in (Windows allows renaming a mapped DLL), then the loader re-inits.
+  Runtime DLLs staged next to the plugin (e.g. `libfftw3f-3.dll`) are deployed the same way. `file_locked()`
+  now tests for write access (a mapped DLL is readable, so the old check never detected locks).
+- **Parameter mirroring** keeps the plugin's parameter **pages** (`MirrorPages` option), groups vector
+  components through `tupletName`, copies menus before values, uses a signature to skip rebuilds when nothing
+  changed, and re-binds cheaply otherwise.
+- **Graceful configuration**: missing/invalid `settings.ini` no longer kills the extension; only
+  `PluginBuilderDir` is required — `vcvarsall`, `ninja` and `cmake` are discovered via `vswhere`, `PATH` and the
+  Visual Studio-bundled tools. Lazy runner start; no CMake configure at every init (inputs are hashed).
+- Plugin name validation and opType sanitisation (`FFT_v2` → `Fftv2`) with a built-in operator collision check;
+  `TDProjectName` handles dotted names; `Compile On Update` is respected by `OnSourceUpdate`; repeated saves
+  during a build coalesce into one rebuild; `.vscode/` generated per project.
+- POP loader support (`cplusplusPOP`) when the running TouchDesigner has it.
+- The extension loads `PluginBuilderCore` / `CMakeBlocks` from `PluginBuilderDir/source` on disk, so a stale
+  DAT inside the `.tox` can no longer shadow the current code.
+
+### Tooling
+- `tests/test_core.py` — 23 headless unit tests (naming, settings, templates, manifests, diagnostics, runner,
+  hot-swap, SDK versions, VS Code rendering).
+- `dev/ci.py` — scaffolds every template, configures + builds the non-CUDA ones and optional existing projects
+  (`--project`), usable in GitHub Actions `windows-latest`.
+- `dev/sync_templates.py` — regenerates `include/` and `templates/` from an installed TouchDesigner.
+- `dev/deploy.py` verifies the code DATs are file-linked and strips `__pycache__` before exporting the `.tox`.
+
+### Docs
+- README rewritten; AUDIT.md replaced by a current-state audit; settings template documents the optional keys.
 
 ---
 
 ## [2.0.0] - 2026-07-24
 
-### 🚀 Major Highlights
-
-- **Universal Dynamic Parameter Mirroring Engine**: Intelligently inspects and reflects custom parameters from dynamic C++ operator DLLs directly onto the parent COMP's **'Custom'** parameter page tab with automatic binding and vector support.
-- **Subprocess & Extension Lifecycle Hardening**: Replaces destructive parent COMP recursive cooking with target operator re-initialization, eliminating extension instance destruction and maintaining persistent background build toolchains.
-- **Zero-Latency MSVC Compilation Environment**: Manages a persistent `cmd.exe` background process pre-loaded with `vcvarsall.bat x64` and Ninja, avoiding compiler setup overhead on every build.
-- **Repomix Architectural Reference ([AUDIT.md](file:///c:/Users/Z/Downloads/PROJECTS/TD_PROJECTS/PluginBuilder/PluginBuilder_V2/AUDIT.md))**: Complete architectural audit report detailing repository topology, component mapping, and file specifications.
-
----
-
-### 🌟 Added
-
-#### Core Engine & Extension (`source/PluginBuilderExt.py`)
-- **Universal Parameter Binding Engine (`_sync_single_parameter`)**:
-  - Dynamically detects and mirrors C++ plugin parameters (`Float`, `Int`, `Toggle`, `Menu`, `Str`, `Pulse`, `Header`) onto TouchDesigner COMP parameter pages.
-  - Full vector parameter dimension support for `XYZ`, `UV`, `RGB`, and `RGBA` tuples.
-  - Dynamic `ParMode.BIND` expression creation for two-way parameter state synchronization.
-  - String-set parameter name deduplication preventing single-float numeric parameter dropping caused by `td.Par.__eq__` evaluation edge cases.
-- **Pulse Parameter Dispatcher (`OnParPulse`)**:
-  - Event routing mechanism for non-bindable pulse parameters (e.g. `Reset`).
-  - Automatically triggers `pulsePressed()` hooks in the underlying C++ DLL instance.
-- **Subprocess Recovery & Guard System**:
-  - Automatic process state inspection (`poll()`) inside `SendCommand()` with auto-restart fallback when the build process terminates unexpectedly.
-  - Clean resource cleanup in `close_subprocess()` terminating background tasks and joining daemon stdout reader threads to prevent zombie process file locks on DLLs.
-
-#### Telemetry & Telemetry Deduplication
-- Tagged logging framework (`_log`) categorization (`[Init]`, `[Create]`, `[Build]`, `[Compile]`, `[Install]`, `[ParamSync]`, `[Subprocess]`).
-- State-change log suppression algorithm for parameter synchronization, suppressing redundant textport messages unless active parameter sets change.
-
-#### Documentation & Environment Configuration
-- **[AUDIT.md](file:///c:/Users/Z/Downloads/PROJECTS/TD_PROJECTS/PluginBuilder/PluginBuilder_V2/AUDIT.md)**: Full Repomix architectural documentation outlining system diagrams, directory layouts, and file responsibilities.
-- **[CHANGELOG.md](file:///c:/Users/Z/Downloads/PROJECTS/TD_PROJECTS/PluginBuilder/PluginBuilder_V2/CHANGELOG.md)**: Standardized versioning history.
-- **`SetSettings.toe` / `SetSettings.6.toe`**: TouchDesigner setting files pre-configured for local development path setup.
-
----
-
-### 🔧 Changed
-
-- **Plugin Reload Pipeline (`_do_copy_plugin`)**:
-  - Replaced parent COMP recursive cooking (`ownerComp.cook(recurse=True)`) with targeted loader operator re-initialization (`reinitpulse.pulse()` and `loader_op.cook(force=True)`).
-  - Preserves active Python extension instances and prevents active background build processes from being killed during hot-reloading.
-- **Repository Exclusions ([.gitignore](file:///c:/Users/Z/Downloads/PROJECTS/TD_PROJECTS/PluginBuilder/PluginBuilder_V2/.gitignore))**: Added `__pycache__/` and `*.pyc` rules to prevent tracking Python bytecode cache files.
-
----
-
-### 🐛 Fixed
-
-- **Eliminated Duplicate `[ParamSync]` Telemetry Log Output**: Removed premature `sync_custom_parameters()` calls in `compile_plugin()` and `build_plugin()`, guaranteeing parameter sync fires strictly once after the C++ DLL is copied and reloaded.
-
----
-
-### 🛡️ Technical Specifications & Compatibility Matrix
-
-| Feature | TouchDesigner Compatibility | Toolchain | Operating System |
-|---|---|---|---|
-| **C++ Operator Hot-Reload** | TouchDesigner 2023+ | MSVC x64 / Ninja / CMake 3.21+ | Windows 10/11 x64 |
-| **Dynamic Parameter Sync** | TouchDesigner 2023+ (td.Par / ParMode.BIND) | Python 3.11 Embedded | Windows 10/11 x64 |
+- Dynamic parameter mirroring onto the COMP's `Custom` page with BIND expressions and vector support.
+- Targeted loader re-init instead of recursive COMP cooking; persistent `cmd.exe` + `vcvarsall` subprocess with
+  auto-restart; debounced DLL copy with file-lock retries; `ast.literal_eval` for the CMake header comment;
+  `CONFIGURE_DEPENDS` globbing; tagged logging.

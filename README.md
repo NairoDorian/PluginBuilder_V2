@@ -1,75 +1,91 @@
-# PluginBuilder
+# PluginBuilder V2
 
-PluginBuilder is a development tool designed to accelerate the process of building, developing, and compiling plugins for TouchDesigner from within TouchDesigner. It facilitates real-time, script-like editing of plugins by leveraging CMake and Ninja for rapid compilation. The system automatically recompiles and reloads the plugin upon any source changes, with extremely fast build times that typically run under a second.
+PluginBuilder is a development tool for building, hot-reloading and installing C++ custom operators
+(CHOP / TOP / DAT / SOP / **POP**) for TouchDesigner, from inside TouchDesigner. It drives CMake + Ninja
+through a persistent MSVC environment, recompiles on every source save (usually well under a second),
+swaps the new DLL into the running `.toe` without an unload gap, mirrors the plugin's custom parameters
+(pages preserved) onto the PluginBuilder COMP, and reports build results (status, timings, parsed compiler
+errors) on the COMP itself.
 
-The build and compile processes are non-blocking, allowing TouchDesigner to run without any major stalls. The initial build (triggered by Create Plugin) is usually the longest where subsequent updates are completed in less than a second with minimal frame drops, depending on the caching and the scope of changes.
+V2 compiles against the **C++ API 10** headers shipped with TouchDesigner 2025.30000+ (`include/`,
+synced from the installed `Samples/CPlusPlus` by `dev/sync_templates.py`) and warns when the running
+TouchDesigner ships a different SDK version.
 
 ## Requirements
 
-- **TouchDesigner**: Version 2023.11600 or newer, with a commercial or pro license.
-- **Visual Studio**: C++ development tools installed.
-- **CMake**: Installed and added to the system or user PATH.
-- **Ninja**: Installed and recognized in the system PATH.
-- **OS**: Windows only at this time.
-   ### Optional
-   - In order to build and compile plugins that depend on Cuda you'll need to install Cuda Toolkit. Currently TD uses [CUDA 11.8](https://developer.nvidia.com/cuda-11-8-0-download-archive) so that will be the easiest CUDA version to get working without requiring copying .dll's to the plugin or project path. 
+- **TouchDesigner** 2025.30000 or newer (commercial / pro / educational license — CPlusPlus operators).
+- **Visual Studio** 2022 or 2026 with the *Desktop development with C++* workload (found automatically via `vswhere`).
+- **CMake** ≥ 3.21 and **Ninja** — the copies bundled with Visual Studio's *C++ CMake tools* component are
+  found automatically; otherwise put them on `PATH` or set the paths in `settings.ini`.
+- **Windows** x64. (Optional) CUDA Toolkit 12.x for the CUDA templates.
 
 ## Installation
 
-1. **PluginBuilder**:
-   Clone or download PluginBuilder from its repository.
-2. **Visual Studio**:
-   If not already installed, install [Visual Studio](https://visualstudio.microsoft.com) with C++ development tools.
-3. **CMake**:
-   If not already installed, install [CMake](https://cmake.org/download). Ensure it is added to your system path.
-4. **Ninja**:
-   If `ninja.exe` is not in your PATH, download it from [Ninja Releases](https://github.com/ninja-build/ninja/releases/tag/v1.12.0), unzip, and copy `ninja.exe` to `${USER_PATH}/ninja`.
-5. **Configure settings.ini**:
-   - In the PluginBuilder directory open `SetSettings.toe`.
-   - Navigate to the textDAT named `settings`.
-   - Edit the fields as instructed in the comments.
-   - The `settings.ini` file will be saved to `${USER_PATH}/AppData/Roaming/IntentDev/PluginBuilder`.
+1. Clone / download PluginBuilder_V2.
+2. Open `SetSettings.toe`, set `PluginBuilderDir` in the `settings` DAT (everything else is optional — see
+   `dev/settings_template.ini`) and run it. `settings.ini` is written to `%APPDATA%/IntentDev/PluginBuilder/`.
+3. (Optional) `python dev/sync_templates.py` to resync `include/` and `templates/` from a different TouchDesigner build.
 
 ## Usage
 
-1. **Load PluginBuilder**:
-   Drag `PluginBuilder.tox` into an existing TouchDesigner project saved on disk. (PluginBuilder can also be added to palette, but do not delete the PluginBuilder directory that is set in settings.ini...)
-2. **Set Plugin Name**:
-   Enter a name for your plugin in the `Plugin Name` parameter.
-3. **Select a Template**:
-   Choose a template from the `Plugin Template` menu.
-4. **Create Plugin**:
-   Click `Create Plugin`. This will generate:
-   - A `PluginProjects` folder in your project directory, containing a subfolder for your plugin. This subfolder includes a source folder with the copied template source.
-   - A `Plugins` folder containing the `.dll` files. These are managed by PluginBuilder and loaded in `plugin_loader` CPlusPlus operator inside PluginBuilder.
-5. **Edit Source Files**:
-   If `Compile On Update` is Active, any source change will automatically trigger a rebuild and compile. Ensure to save changes in your .toe before editing any source files - crashes due to a dll compiled with coding errors can happen...
-7. **Edit CMake**:
-   Edit CMakelists.txt as required to include additional libraries.
-8. **Install Plugin**:
-   This will install a completed plugin in the global plugins folder located in `Documents/Derivative/Plugins` for use in other projects.
+1. Drag `PluginBuilder.tox` into a TouchDesigner project **saved on disk**.
+2. Enter a **Plugin Name** (letters, digits, `_`; it becomes the CMake target, class name and DLL name — the
+   TouchDesigner opType is derived and validated automatically, e.g. `FFT` → `Fft`, with a collision check
+   against built-in operators).
+3. Pick a **Plugin Template** (BasicCHOP, CHOPWithPythonClass, BasicDAT, CPUMemoryTOP, CudaTOP, SimpleShapesSOP,
+   SimpleShapesPOP, CudaPOP — discovered from `templates/*/template.json`).
+4. **Create Plugin** generates
+   - `PluginProjects/<Name>/CMakeLists.txt` (15 lines; includes `cmake/TDPlugin.cmake`), `plugin.json`,
+     `CMakePresets.json`, `launch.vs.json`, `.vscode/` (attach-to-TouchDesigner + IntelliSense via
+     `compile_commands.json`) and `source/` from the template,
+   - `__Plugins__/<Name>/` for the deployed DLL(s),
+   - the loader chain (`in1` → `plugin_loader` → `out1`) inside the COMP,
+   and starts the first configure + build.
+5. Edit the sources. With **Compile On Update** on, every save triggers a Ninja build; when it succeeds and the DLL
+   actually changed (hash-gated), the DLL and any runtime DLLs are swapped in with the rename-in-place trick and
+   the loader re-inits. Custom parameters are mirrored onto the COMP with their original pages and BIND expressions.
+6. **Status** page: `Build Status`, `Last Build`, `Loaded DLL`, `Cancel Build`, `Clean Build Dir`,
+   `Force Reload Plugin`, `Run Tests (ctest)`. Compiler diagnostics are parsed into `builder/build_errors`
+   (severity, file, line, code, message) and the first error is shown as a COMP error.
+7. **Install Plugin** copies `__Plugins__/<Name>/` to `Documents/Derivative/Plugins/<Name>/`.
 
-   [Usage Video Link](https://youtu.be/1kj_V__-NJg)
+Type the name of an existing `PluginProjects/<Name>` to reopen it (the manifest tells PluginBuilder the family).
 
-## Visual Studio workflow debugging plugin loaded a custom operator in TD
+### Extending a project's CMake
 
-1. **Create PluginBuilder Project**:
-   Follow steps 1 through 4 in **Usage** above and toggle off the `Compile On Update` parameter. Save the `{YourToeName}.toe`.
-2. **Load Plugin**:
-   Restart the .toe so the new plugin shows up in the Op Create Dialog and load the custom operator in your network. Optionally disable cooking on PluginBuilder. Save and close `{YourToeName}.toe`.
-3. **Open Visual Studio**:
-   Either right click in the the Plugin Project directory for your plugin and select Open with Visual Studio or open Visual Studio and select Open CMake project and navigate to the plugin project directory and open it.
-4. **Edit and compile**:
-   Edit and compile as required in Visual Studio
-5. **Debug**:
-   In the `Select Startup Item` dropdown menu at the top of the Visual Studio editor select `Launch {YourToeName}.toe`. Now click `Launch {YourToeName}.toe` to start TD attached to the Visual Studio Debugger, with the path to `{YourToeName}.toe` passed as an argument.
+```cmake
+td_add_plugin(MyPlugin FAMILY CHOP)
+td_plugin_use_fftw3(MyPlugin)              # vendored 3rdParty/fftw3 (plugin, PluginBuilder or TD samples tree)
+td_plugin_use_opencv(MyPlugin)             # vendored OpenCV
+td_plugin_use_python(MyPlugin)             # embedded CPython headers / import lib
+td_plugin_optimize(MyPlugin AVX2 FAST_MATH LTO)
+td_plugin_add_runtime_dll(MyPlugin "${SOME_DLL}")
+td_plugin_add_test(MyPlugin my_tests SOURCES tests/main.cpp)   # headless ctest target
+td_plugin_add_bench(MyPlugin my_bench SOURCES bench/main.cpp)
+```
+See `cmake/TDPlugin.cmake` for the full list and the `TD_PLUGIN_WARNINGS` / `TD_PLUGIN_ASAN` options.
 
-   [VS Workflow Video Link](https://youtu.be/f8rl4IRgeLo)
+## Visual Studio / VS Code
 
-## Visual Studio Notes
+- **Visual Studio**: open the project folder as a CMake project; `launch.vs.json` launches TouchDesigner with the
+  `.toe` under the debugger (turn *Compile On Update* off first so VS owns the build).
+- **VS Code**: `.vscode/launch.json` has *Attach to running TouchDesigner* (the hot-reload-friendly way) and
+  *Launch TouchDesigner*; IntelliSense uses `build/compile_commands.json`.
 
-   A path has been set for the PluginBuilder directory in `CMakeList.txt` and a paths for `TouchDesigner.exe` and `{YourToeName}.toe` have been set in `launch.vs.json` (located in the plugin project directory). If any of these paths change the respective files will need to be manually updated for Visual Studio to successfully configure, generate and compile the CMake project. The harcoded variables will have no effect on building from within PluginBuilder.
+## Development
+
+```
+python -m unittest discover -s tests -v      # 23 headless tests for source/PluginBuilderCore.py
+python dev/ci.py --all                       # + scaffold every template and build the non-CUDA ones
+python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT
+python dev/sync_templates.py                 # resync SDK headers + templates from the installed TouchDesigner
+```
+`source/PluginBuilderCore.py` holds all TouchDesigner-independent logic (naming, settings, toolchain
+discovery, templates, manifests, diagnostics parsing, the build runner, hot-swap file replacement);
+`source/PluginBuilderExt.py` is the thin TouchDesigner adapter. The extension loads both from disk under
+`PluginBuilderDir/source`, so the `.tox` always runs the current code. `dev/deploy.py` (run inside `dev/dev.toe`)
+re-exports `PluginBuilder.tox`.
 
 ## Contributing
 
-Contributions to PluginBuilder are welcome and appreciated! If you're interested in improving the tool or adding new features please start a discussion!
+Issues and pull requests are welcome — please run `python dev/ci.py --all` before opening one.

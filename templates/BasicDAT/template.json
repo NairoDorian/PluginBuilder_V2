@@ -1,0 +1,14 @@
+{
+  "name": "BasicDAT",
+  "family": "DAT",
+  "replace": "BasicDAT",
+  "main_source": "BasicDAT.cpp",
+  "features": [],
+  "description": "Basic DAT: generates or filters table/text data.",
+  "api_version": 4,
+  "sample_origin": "DAT",
+  "sources": [
+    "BasicDAT.cpp",
+    "BasicDAT.h"
+  ]
+}

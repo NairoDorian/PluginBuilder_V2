@@ -1,0 +1,14 @@
+{
+  "name": "SimpleShapesPOP",
+  "family": "POP",
+  "replace": "SimpleShapesPOP",
+  "main_source": "SimpleShapesPOP.cpp",
+  "features": [],
+  "description": "POP (point operator) generating simple shapes into GPU buffers.",
+  "api_version": 1,
+  "sample_origin": "SimpleShapesPOP",
+  "sources": [
+    "SimpleShapesPOP.cpp",
+    "SimpleShapesPOP.h"
+  ]
+}

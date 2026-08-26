@@ -32,9 +32,10 @@ void
 FillDATPluginInfo(DAT_PluginInfo *info)
 {
 	// Always return DAT_CPLUSPLUS_API_VERSION in this function.
-	info->apiVersion = DATCPlusPlusAPIVersion;
+	if (!info->setAPIVersion(DATCPlusPlusAPIVersion))
+		return;
 
-	// The opType is the unique name for this DAT. It must start with a
+	// The opType is the unique name for this TOP. It must start with a
 	// capital A-Z character, and all the following characters must lower case
 	// or numbers (a-z, 0-9)
 	info->customOPInfo.opType->setString("#__OP_TYPE__#");
@@ -52,6 +53,9 @@ FillDATPluginInfo(DAT_PluginInfo *info)
 	// This DAT works with 0 or 1 inputs
 	info->customOPInfo.minInputs = 0;
 	info->customOPInfo.maxInputs = 1;
+
+	// Custom website URL that the Operator Help can point to
+	info->customOPInfo.opHelpURL->setString("#__OP_HELPURL__#");
 
 }
 

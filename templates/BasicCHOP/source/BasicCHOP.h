@@ -19,7 +19,7 @@ using namespace TD;
 /*
 
 This example file implements a class that does 2 different things depending on
-if a BasicCHOP is connected to the CPlusPlus CHOPs input or not.
+if a CHOP is connected to the CPlusPlus CHOPs input or not.
 The example is timesliced, which is the more complex way of working.
 
 If an input is connected the node will output the same number of channels as the
@@ -63,6 +63,11 @@ public:
 	virtual void		pulsePressed(const char* name, void* reserved1) override;
 	virtual void		buildDynamicMenu(const OP_Inputs* inputs, OP_BuildDynamicMenuInfo* info, void* reserved1) override;
 
+	virtual void		saveData(OP_NodeSaveState* saver, void* reserved1) override;
+	virtual void		loadData(const OP_NodeLoadState* loader, void* reserved1) override;
+
+	virtual void		inputConnectorLabel(int index, OP_InputLabel* inputLabel, void* reserved1) override;
+
 private:
 
 	// We don't need to store this pointer, but we do for the example.
@@ -71,7 +76,7 @@ private:
 	const OP_NodeInfo*	myNodeInfo;
 
 	// In this example this value will be incremented each time the execute()
-	// function is called, then passes back to the BasicCHOP 
+	// function is called, then passes back to the CHOP 
 	int32_t				myExecuteCount;
 
 

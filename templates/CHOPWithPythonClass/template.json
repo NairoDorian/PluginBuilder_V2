@@ -1,0 +1,16 @@
+{
+  "name": "CHOPWithPythonClass",
+  "family": "CHOP",
+  "replace": "CHOPWithPythonClass",
+  "main_source": "CHOPWithPythonClass.cpp",
+  "features": [
+    "python"
+  ],
+  "description": "CHOP exposing a custom Python class/methods via the CPython C API.",
+  "api_version": 10,
+  "sample_origin": "CHOPWithPythonClass",
+  "sources": [
+    "CHOPWithPythonClass.cpp",
+    "CHOPWithPythonClass.h"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "name": "BasicCHOP",
+  "family": "CHOP",
+  "replace": "BasicCHOP",
+  "main_source": "BasicCHOP.cpp",
+  "features": [],
+  "description": "Basic CHOP: timesliced generator/filter with custom parameters and dynamic menu.",
+  "api_version": 10,
+  "sample_origin": "CHOP",
+  "sources": [
+    "BasicCHOP.cpp",
+    "BasicCHOP.h"
+  ]
+}

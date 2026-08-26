@@ -1,0 +1,16 @@
+{
+  "name": "CPUMemoryTOP",
+  "family": "TOP",
+  "replace": "CPUMemoryTOP",
+  "main_source": "CPUMemoryTOP.cpp",
+  "features": [],
+  "description": "TOP filled from CPU memory with a threaded frame queue.",
+  "api_version": 12,
+  "sample_origin": "CPUMemoryTOP",
+  "sources": [
+    "CPUMemoryTOP.cpp",
+    "CPUMemoryTOP.h",
+    "FrameQueue.cpp",
+    "FrameQueue.h"
+  ]
+}

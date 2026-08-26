@@ -1,116 +1,84 @@
 """
-CMakeBlocks.py — Modular CMakeLists.txt Template Assembler for PluginBuilder_V2
+CMakeBlocks.py — CMakeLists.txt generator for PluginBuilder projects.
 
-This module defines string templates used by PluginBuilderExt.py to dynamically
-assemble a complete CMakeLists.txt file for new C++ TouchDesigner custom operators.
+Generated projects are deliberately tiny: all shared logic lives in
+``PluginBuilder_V2/cmake/TDPlugin.cmake`` (included at configure time), so fixes and
+new features reach every existing project on its next configure instead of being
+frozen into per-project text.
 
-Template Placeholders:
-  __PLUGIN_TYPE__        : 'CHOP', 'TOP', 'DAT', or 'SOP' (header comment for auto-detection)
-  __PLUGIN_NAME__        : Name of the C++ plugin project (e.g. 'MyCustomCHOP')
-  __PLUGIN_BUILDER_DIR__ : Absolute path to the PluginBuilder installation directory
+Placeholders:
+  __PLUGIN_TYPE__        : 'CHOP', 'TOP', 'DAT', 'SOP' or 'POP'
+  __PLUGIN_NAME__        : plugin / CMake target name
+  __PLUGIN_BUILDER_DIR__ : absolute PluginBuilder directory (fallback only — the live value is
+                           passed as -DPLUGIN_BUILDER_DIR by PluginBuilder, or taken from the
+                           PLUGIN_BUILDER_DIR environment variable)
+  __FEATURES__           : space separated td_add_plugin FEATURES (cuda / python / opencv), may be empty
+  __EXTRA__              : extra per-template lines (e.g. td_plugin_optimize)
 """
 
-# Header comment & minimum CMake version configuration
-start_block = '''# {'plugin_type': __PLUGIN_TYPE__}
-cmake_minimum_required (VERSION 3.21)
+# Header comment (kept for backward compatibility: PluginBuilder reads plugin_type from it;
+# plugin.json is the primary manifest for new projects).
+HEADER = "# {'plugin_type': __PLUGIN_TYPE__}\n"
 
-# Enable Hot Reload for MSVC compilers if supported.
-if (POLICY CMP0141)
-  cmake_policy(SET CMP0141 NEW)
-  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
+BODY = '''cmake_minimum_required(VERSION 3.21)
+project(__PLUGIN_NAME__ LANGUAGES CXX)
+
+# ---------------------------------------------------------------------------
+# PluginBuilder shared module. PLUGIN_BUILDER_DIR is normally passed by
+# PluginBuilder (-D) or set in the environment; the fallback below is the
+# location recorded when this project was created.
+# ---------------------------------------------------------------------------
+if(NOT PLUGIN_BUILDER_DIR AND NOT DEFINED ENV{PLUGIN_BUILDER_DIR})
+    set(PLUGIN_BUILDER_DIR __PLUGIN_BUILDER_DIR__)
 endif()
-
-if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
-  set(CMAKE_BUILD_TYPE Release CACHE STRING "Choose the type of build." FORCE)
-  set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS "Debug" "Release" "RelWithDebInfo")
+if(NOT PLUGIN_BUILDER_DIR)
+    set(PLUGIN_BUILDER_DIR "$ENV{PLUGIN_BUILDER_DIR}")
 endif()
-
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED True)
-set(CMAKE_CXX_EXTENSIONS ON)
-
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/Debug)
-    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib/Debug)
-    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib/Debug)
-elseif(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/Release)
-    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib/Release)
-    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib/Release)
-elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/RelWithDebInfo)
-    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib/RelWithDebInfo)
-    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib/RelWithDebInfo)
+if(NOT EXISTS "${PLUGIN_BUILDER_DIR}/cmake/TDPlugin.cmake")
+    message(FATAL_ERROR "PluginBuilder not found at '${PLUGIN_BUILDER_DIR}'. Pass -DPLUGIN_BUILDER_DIR=<path to PluginBuilder_V2>.")
 endif()
+include(${PLUGIN_BUILDER_DIR}/cmake/TDPlugin.cmake)
 
-'''
+# ---------------------------------------------------------------------------
+# The plugin. Add dependencies below, e.g.
+#   td_plugin_use_fftw3(__PLUGIN_NAME__)
+#   td_plugin_use_opencv(__PLUGIN_NAME__)
+#   td_plugin_optimize(__PLUGIN_NAME__ AVX2 FAST_MATH)
+#   td_plugin_add_test(__PLUGIN_NAME__ __PLUGIN_NAME___tests SOURCES tests/test_main.cpp)
+# ---------------------------------------------------------------------------
+td_add_plugin(__PLUGIN_NAME__ FAMILY __PLUGIN_TYPE_BARE__ __FEATURES_KW__)
+__EXTRA__'''
 
-project_block = '''
-project (__PLUGIN_NAME__ LANGUAGES CXX)
-'''
+FEATURE_EXTRAS = {
+    'cuda': '',
+    'python': '',
+    'opencv': '',
+}
 
-cuda_project_block = '''
-set(CMAKE_CUDA_ARCHITECTURES 75;80;86;89)
-project (__PLUGIN_NAME__ LANGUAGES CXX CUDA)
-'''
 
-core_block = '''
-set(PLUGIN_BUILDER_DIR __PLUGIN_BUILDER_DIR__ CACHE PATH "Path to PluginBuilder directory" FORCE)
-set(PLUGIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../__Plugins__/__PLUGIN_NAME__")
-set(SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/source)
+def assemble(plugin_name, plugin_type, plugin_builder_dir, features=(), extra_lines=()):
+    """Return the CMakeLists.txt text for a new plugin project."""
+    features = [f for f in features if f]
+    features_kw = f"FEATURES {' '.join(features)}" if features else ''
+    extra = ''.join(line.rstrip('\n') + '\n' for line in extra_lines)
+    text = HEADER + BODY
+    text = text.replace('__PLUGIN_TYPE_BARE__', plugin_type)
+    text = text.replace('__PLUGIN_TYPE__', f"'{plugin_type}'")
+    text = text.replace('__PLUGIN_NAME__', plugin_name)
+    text = text.replace('__PLUGIN_BUILDER_DIR__', f'"{plugin_builder_dir}"')
+    text = text.replace('__FEATURES_KW__', features_kw)
+    text = text.replace('__EXTRA__', extra)
+    # tidy the td_add_plugin line when no features
+    text = text.replace(' )', ')')
+    return text
 
-set(PRINT_SOURCE_FILES On)
-if(PRINT_SOURCE_FILES)
-    foreach(source IN LISTS PROJ_SOURCE_FILES)
-      message(STATUS "__PLUGIN_NAME__ source: ${source}")
-    endforeach()
-endif()
 
-set(INCLUDE_DIR "${PLUGIN_BUILDER_DIR}/include")
-# print expanded INCLUDE_DIR
-message(STATUS "INCLUDE_DIR: ${INCLUDE_DIR}")
-
-# Collect all source files and exclude gtest files.
-file(GLOB_RECURSE PROJ_SOURCE_FILES CONFIGURE_DEPENDS
-"${SOURCE_DIR}/*.cpp" "${SOURCE_DIR}/*.c" "${SOURCE_DIR}/*.cu" "${SOURCE_DIR}/*.h" "${SOURCE_DIR}/*.cuh")
-
-add_library(__PLUGIN_NAME__ SHARED ${PROJ_SOURCE_FILES})
-target_include_directories(__PLUGIN_NAME__ PRIVATE ${SOURCE_DIR} ${INCLUDE_DIR})
-
-if(DEFINED ENV{PLUGINBUILDER_BUILD})
-  message(STATUS "PluginBuilder is building __PLUGIN_NAME__")
-else()  
-  if(MSVC)
-    target_compile_options(__PLUGIN_NAME__ PUBLIC "/Zi")
-    target_link_options(__PLUGIN_NAME__ PUBLIC "/INCREMENTAL")
-  endif()
-
-  add_custom_command(TARGET __PLUGIN_NAME__ POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    $<TARGET_FILE:__PLUGIN_NAME__> "${PLUGIN_DIR}")
-endif()
-'''
-
-cuda_block = '''
-# CUDA
-#################################################################################################
-find_package(CUDAToolkit REQUIRED)
-message(STATUS CUDAToolkit_INCLUDE_DIRS=${CUDAToolkit_INCLUDE_DIRS})
-target_include_directories(__PLUGIN_NAME__ PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
-target_link_libraries(__PLUGIN_NAME__ PRIVATE CUDA::cudart)
-
-# Post-build command to copy the CUDA runtime DLL to the output directory
-# set(cuda_runtime_dll "${CUDAToolkit_BIN_DIR}/cudart64_118.dll")
-# add_custom_command(TARGET __PLUGIN_NAME__ POST_BUILD
-#   COMMAND ${CMAKE_COMMAND} -E copy_if_different
-#   ${cuda_runtime_dll} $<TARGET_FILE_DIR:__PLUGIN_NAME__>)
-
-'''
-
-python_block = '''
-# Python
-#################################################################################################
-target_include_directories(__PLUGIN_NAME__ PRIVATE "${PLUGIN_BUILDER_DIR}/3rdParty/Python/Include" "${PLUGIN_BUILDER_DIR}/3rdParty/Python/Include/PC")
-target_link_directories(__PLUGIN_NAME__ PRIVATE "${PLUGIN_BUILDER_DIR}/3rdParty/Python/lib/x64")
-
-'''
+# ---------------------------------------------------------------------------
+# Backward-compatible module-level strings (older code assembled these directly).
+# ---------------------------------------------------------------------------
+start_block = HEADER
+project_block = ''
+cuda_project_block = ''
+core_block = BODY
+cuda_block = ''
+python_block = ''

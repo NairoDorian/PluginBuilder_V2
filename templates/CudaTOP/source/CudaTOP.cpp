@@ -29,12 +29,13 @@ void
 FillTOPPluginInfo(TOP_PluginInfo *info)
 {
 	// This must always be set to this constant
-	info->apiVersion = TOPCPlusPlusAPIVersion;
+	if (!info->setAPIVersion(TOPCPlusPlusAPIVersion))
+		return;
 
 	// Change this to change the executeMode behavior of this plugin.
 	info->executeMode = TOP_ExecuteMode::CUDA;
 
-	// The opType is the unique name for this BasicCHOP. It must start with a 
+	// The opType is the unique name for this TOP. It must start with a 
 	// capital A-Z character, and all the following characters must lower case
 	// or numbers (a-z, 0-9)
 	info->customOPInfo.opType->setString("#__OP_TYPE__#");
@@ -52,6 +53,9 @@ FillTOPPluginInfo(TOP_PluginInfo *info)
 	// This TOP works with 0 or 1 inputs connected
 	info->customOPInfo.minInputs = 0;
 	info->customOPInfo.maxInputs = 1;
+
+	// Custom website URL that the Operator Help can point to
+	info->customOPInfo.opHelpURL->setString("#__OP_HELPURL__#");
 }
 
 DLLEXPORT

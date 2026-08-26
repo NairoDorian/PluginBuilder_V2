@@ -1,0 +1,14 @@
+{
+  "name": "SimpleShapesSOP",
+  "family": "SOP",
+  "replace": "SimpleShapesSOP",
+  "main_source": "SimpleShapesSOP.cpp",
+  "features": [],
+  "description": "SOP generating simple geometry with attributes.",
+  "api_version": 4,
+  "sample_origin": "SimpleShapesSOP",
+  "sources": [
+    "SimpleShapesSOP.cpp",
+    "SimpleShapesSOP.h"
+  ]
+}

@@ -1,6 +1,7 @@
 """MIT License
 
 Copyright (c) 2024 Keith Lostracco
+Copyright (c) 2026 PluginBuilder_V2 contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -21,1398 +22,1361 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
-import configparser
+# =================================================================================================
+# PluginBuilderExt — TouchDesigner adapter around PluginBuilderCore.
+#
+#   * All TouchDesigner-independent logic (naming, settings, templates, manifests, diagnostics,
+#     the build runner, hot-swap file replacement) lives in source/PluginBuilderCore.py and is
+#     unit-tested headlessly.  This file only talks to TouchDesigner.
+#   * Public entry points called from the .tox (parexec / folder DATs / execute DAT) keep their
+#     names:  OnParValueChange, OnParPulse, OnPluginUpdate, OnSourceUpdate, OnCMakeListsUpdate,
+#     CheckAndPrintOutput, RefreshDats, PostCreatePlugin, EnableCreatePars, BuildAndCompile,
+#     SendCommand, GetOutput, PrintOutput, sync_custom_parameters, create_plugin, build_plugin,
+#     compile_plugin, install_plugin, close_subprocess, start_subprocess, clear_plugin_builder.
+#
+# Log prefixes: [Init] [Create] [Build] [Compile] [Build→Copy] [Install] [Source] [CMake]
+#               [Runner] [ParamSync] [Cleanup] [Test]
+# =================================================================================================
+
+import importlib.util
+import json
 import os
 import shutil
-import subprocess
-import threading
-import queue
-import json
-import ast
+import sys
+import time
 
-import CMakeBlocks
+# -------------------------------------------------------------------------------------------------
+# Module loading: prefer the on-disk source files under <PluginBuilderDir>/source so the .tox
+# always runs the current code even when its embedded DATs are stale. Falls back to the DATs.
+# -------------------------------------------------------------------------------------------------
+
+def _load_module_from(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    sys.modules[name] = mod
+    return mod
 
 
-# =================================================================================================
-# Log prefixes used throughout this extension:
-#
-#   [Init]        — Initialization and constructor
-#   [Create]      — Plugin project creation (scaffolding, templates, loader ops)
-#   [Build]       — CMake configure step  (cmake -B build ...)
-#   [Compile]     — Ninja build step      (ninja -C build)
-#   [Build→Copy]  — Post-compile DLL copy from build output → __Plugins__/ (debounced)
-#   [Install]     — Install plugin to ~/Documents/Derivative/Plugins/
-#   [Source]      — Source file change callbacks
-#   [CMake]       — CMakeLists.txt change callbacks
-#   [Subprocess]  — cmd.exe subprocess lifecycle
-#   [Cleanup]     — Teardown, unload, and child destruction
-# =================================================================================================
+def _import_support_module(name, plugin_builder_dir):
+    candidate = os.path.join(plugin_builder_dir or '', 'source', f'{name}.py')
+    if plugin_builder_dir and os.path.exists(candidate):
+        try:
+            return _load_module_from(candidate, name)
+        except Exception as e:  # noqa: BLE001
+            print(f'[Init] WARNING: could not load {candidate}: {e}; falling back to DAT module')
+    return __import__(name)
+
+
+BUILT_IN_LOADER_PARS = {
+    'unloadplugin', 'plugin', 'reinit', 'reinitpulse',
+    'timeslice', 'scope', 'srselect', 'exportmethod',
+    'autoexportroot', 'exporttable', 'commonrenamefrom', 'commonrenameto',
+    'outputresolution', 'resolutionw', 'resolutionh', 'aspect', 'aspectw', 'aspecth',
+    'fill', 'filter', 'coord', 'format', 'pixelformat', 'colorformat',
+    'pageindex', 'renamefrom', 'renameto', 'callbacks', 'language',
+}
+
+STATUS_PAGE = 'Status'
 
 
 class PluginBuilderExt:
-	"""
-	Creates, builds, compiles and installs C++ plugins for TouchDesigner.
-
-	Lifecycle:
-		1. create_plugin()   — scaffold a new plugin project from a template
-		2. build_plugin()    — run CMake configure (generates Ninja build files)
-		3. compile_plugin()  — run Ninja build (produces the .dll)
-		4. OnPluginUpdate()  — auto-copy built DLL into __Plugins__/ (debounced)
-		5. install_plugin()  — copy plugin to ~/Documents/Derivative/Plugins/
-
-	The extension manages a persistent cmd.exe subprocess (with vcvarsall env)
-	for running CMake and Ninja without re-initializing the MSVC environment
-	on every build.
-	"""
-
-	# ========================================================================================== #
-	#  INITIALIZATION                                                                            #
-	# ========================================================================================== #
-
-	def __init__(self, ownerComp):
-		"""Initialize the PluginBuilder extension.
-
-		Sets up component references, loads settings.ini config, validates
-		required paths (PluginBuilderDir, NinjaDir, VCVarsall), starts the
-		build subprocess, and schedules a deferred DAT refresh.
-		"""
-		# --- Core component references ---
-		self.ownerComp = ownerComp
-		self.builderComp = ownerComp.op('builder')
-		self.parent = ownerComp.parent()
-
-		# --- DAT references for file watching ---
-		self.SettingsDat = self.builderComp.op('settings')       # settings.ini content
-		self.folder_binDat = self.builderComp.op('folder_bin')   # watches build output dir
-		self.sourceComp = ownerComp.op('source')
-		self.folder_sourceDat = self.sourceComp.op('sync/folder_source')  # watches source dir
-		self.CMakeListsDat = self.ownerComp.op('CMakeLists')
-
-		# --- Config parsing ---
-		self.user_home = os.environ.get('USERPROFILE', os.environ.get('HOME', ''))
-		self.config = configparser.ConfigParser()
-		self.config.read_string(self.SettingsDat.text)
-
-		# --- Validate required tool paths ---
-		self.PathsValid = False
-		self.PathsValid = self.check_paths()
-
-		# --- Dev mode (skips disabling create pars after plugin creation) ---
-		self.dev_mode = False
-		if self.config.has_section('DevMode'):
-			self.dev_mode = True
-
-		# --- Parameter callback dispatch maps ---
-		self.on_par_value_change_map = {
-			'Outputto': self.onOutputto,
-			'Pluginname': self.onPluginname,
-		}
-
-		self.on_par_pulse_map = {
-			'Createplugin': self.create_plugin,
-			'Buildplugin': self.build_plugin,
-			'Compileplugin': self.compile_plugin,
-			'Closesubprocess': self.close_subprocess,
-			'Installplugin': self.install_plugin,
-			'Refreshcustompars': lambda: self.sync_custom_parameters(force_rebuild=True),
-		}
-
-		# --- Template definitions ---
-		# Maps template menu names → plugin type, source file replacement name, and CMake assembler
-		self.template_map = {
-			'BasicCHOP':            {'type': 'CHOP', 'replace': 'BasicCHOP',           'assemble_cmake': self.assemble_cmake_text_basic},
-			'CHOPWithPythonClass':  {'type': 'CHOP', 'replace': 'CHOPWithPythonClass', 'assemble_cmake': self.assemble_cmake_text_python},
-			'CPUMemoryTOP':         {'type': 'TOP',  'replace': 'CPUMemoryTOP',        'assemble_cmake': self.assemble_cmake_text_basic},
-			'CudaTOP':              {'type': 'TOP',  'replace': 'CudaTOP',             'assemble_cmake': self.assemble_cmake_text_cuda},
-			'BasicDAT':             {'type': 'DAT',  'replace': 'BasicDAT',            'assemble_cmake': self.assemble_cmake_text_basic},
-			'SimpleShapesSOP':      {'type': 'SOP',  'replace': 'SimpleShapesSOP',     'assemble_cmake': self.assemble_cmake_text_basic},
-		}
-
-		# --- Loader op types by plugin type (CHOP/TOP/DAT/SOP) ---
-		self.loader_op_map = {
-			'CHOP': {'loader': cplusplusCHOP, 'in': inCHOP, 'out': outCHOP},
-			'TOP':  {'loader': cplusplusTOP,  'in': inTOP,  'out': outTOP},
-			'DAT':  {'loader': cplusplusDAT,  'in': inDAT,  'out': outDAT},
-			'SOP':  {'loader': cplusplusSOP,  'in': inSOP,  'out': outSOP},
-		}
-
-		# --- Directory conventions ---
-		self.plugin_projects_dir = 'PluginProjects'  # where plugin source projects live
-		self.plugins_dir = '__Plugins__'              # where built DLLs go (local)
-
-		# --- Subprocess state ---
-		self.process = None
-		self.queue = None
-		if self.start_subprocess():
-			self.build_plugin()
-
-		# --- Plugin loader reference (may be None if no plugin is loaded) ---
-		self.loader_op = self.ownerComp.op('plugin_loader')
-
-		# --- Deferred DAT refresh (wait for TD to finish loading) ---
-		run("args[0].RefreshDats()", self.ownerComp, delayFrames=120)
-
-		# --- Retry counter for locked-file copy attempts ---
-		self.open_attempts = 0
-
-		# --- Ensure 'Custom' parameter tab exists and sync custom parameters ---
-		self.sync_custom_parameters()
-
-		self._log('Init', f"PluginBuilderExt initialized (dev_mode={self.dev_mode}, "
-				  f"paths_valid={self.PathsValid}, plugin='{self.Pluginname}')")
-
-	def __del__(self):
-		"""Destructor — ensures the build subprocess is terminated."""
-		self.close_subprocess()
-
-	# ========================================================================================== #
-	#  LOGGING                                                                                   #
-	# ========================================================================================== #
-
-	@staticmethod
-	def _log(tag, message):
-		"""Print a tagged log message.
-
-		All log output from this extension uses this method for consistency.
-		Tags are short identifiers like 'Init', 'Build', 'Install', etc.
-
-		Args:
-			tag: Short category label (e.g. 'Build→Copy', 'Install').
-			message: The log message content.
-		"""
-		print(f"[{tag}] {message}")
-
-	# ========================================================================================== #
-	#  PROPERTIES                                                                                #
-	# ========================================================================================== #
-
-	@property
-	def start_subprocess_base_cmd(self):
-		"""Base command to start the MSVC-initialized cmd.exe subprocess.
-
-		Runs vcvarsall.bat for x64, then appends Ninja's directory to PATH
-		so both cmake and ninja are available without full paths.
-		"""
-		cmd = ['cmd.exe', '/K', self.vcvarsall, 'x64']
-
-		# Add ninja to PATH so it's available alongside cmake
-		cmd.append('&&')
-		cmd.append(f'set PATH=%PATH%;{self.ninja_dir}')
-		return cmd
-
-	@property
-	def cmake_build_cmd(self):
-		"""CMake configure command string.
-
-		Generates Ninja build files with the specified build config
-		(Debug/Release/RelWithDebInfo). Sets PLUGINBUILDER_BUILD env var
-		so CMakeLists.txt can detect PluginBuilder-driven builds.
-		"""
-		config = self.ownerComp.par.Buildconfig.eval()
-		cmd = (f'set PLUGINBUILDER_BUILD="" && cmake -B build -G Ninja '
-			   f'-DPLUGIN_BUILDER_DIR={self.PluginBuilderDir} '
-			   f'-DPLUGIN_DIR={self.plugin_dir} '
-			   f'-DCMAKE_BUILD_TYPE={config}')
-		return cmd
-
-	@property
-	def cmake_clean_cmd(self):
-		"""Ninja clean command string."""
-		return "ninja -C build clean"
-
-	@property
-	def cmake_build_plugin_cmd(self):
-		"""Ninja build command string (compiles the plugin DLL)."""
-		return "ninja -C build"
-
-	@property
-	def working_dir(self):
-		"""Relative path to the plugin's project directory (e.g. PluginProjects/FFT)."""
-		return f"{self.plugin_projects_dir}/{self.Pluginname}"
-
-	@property
-	def abs_working_dir(self):
-		"""Absolute path to the plugin's project directory."""
-		return f"{project.folder}/{self.working_dir}"
-
-	@property
-	def plugin_dir(self):
-		"""Relative path to the plugin's output directory (e.g. __Plugins__/FFT)."""
-		return f"{self.plugins_dir}/{self.Pluginname}"
-
-	@property
-	def Pluginname(self):
-		"""Current plugin name from the component's Pluginname parameter."""
-		return self.ownerComp.par.Pluginname.eval()
-
-	@property
-	def CMakeListsPath(self):
-		"""Relative path to the plugin's CMakeLists.txt."""
-		return f"{self.working_dir}/CMakeLists.txt"
-
-	@property
-	def CMakeListsExists(self):
-		"""True if the plugin's CMakeLists.txt exists on disk."""
-		return os.path.exists(self.CMakeListsPath)
-
-	@property
-	def build_config(self):
-		"""Current build configuration (Debug/Release/RelWithDebInfo)."""
-		return self.ownerComp.par.Buildconfig.eval()
-
-	@property
-	def PluginBuilderDir(self):
-		"""Absolute path to the PluginBuilder installation directory."""
-		return self.get_path('Paths', 'PluginBuilderDir')
-
-	@property
-	def SourceDir(self):
-		"""Relative path to the plugin's source directory."""
-		return f"{self.working_dir}/source"
-
-	@property
-	def ninja_dir(self):
-		"""Absolute path to the directory containing ninja.exe."""
-		return self.get_path('Paths', 'NinjaDir')
-
-	@property
-	def template_dir(self):
-		"""Absolute path to the PluginBuilder templates directory."""
-		return f"{self.PluginBuilderDir}/templates"
-
-	@property
-	def vcvarsall(self):
-		"""Absolute path to vcvarsall.bat (MSVC environment setup)."""
-		return self.get_path('Paths', 'VCVarsall')
-
-	@property
-	def CurrentBinDir(self):
-		"""Relative path to the build output bin directory (config-specific)."""
-		return f"PluginProjects/{self.Pluginname}/build/bin/{self.build_config}"
-
-	@property
-	def TDProjectName(self):
-		"""TouchDesigner project name (without version/extension suffixes)."""
-		vals = project.name.split('.')
-		if len(vals) > 2:
-			return ''.join(vals[:-2])
-		return vals[0]
-
-	@property
-	def TDPath(self):
-		"""Absolute path to TouchDesigner.exe."""
-		return f"{app.binFolder}/TouchDesigner.exe"
-
-	@property
-	def PluginPath(self):
-		"""Relative path to the plugin DLL in __Plugins__/."""
-		return f"{self.plugin_dir}/{self.Pluginname}.dll"
-
-	@property
-	def build_path(self):
-		"""Relative path to the built DLL in the build output directory."""
-		return f"{self.CurrentBinDir}/{self.Pluginname}.dll"
-
-	@property
-	def CompileOnUpdate(self):
-		"""Whether to auto-compile when source files change."""
-		return self.ownerComp.par.Compileonupdate.eval()
-
-	# ========================================================================================== #
-	#  INTERNAL METHODS                                                                          #
-	# ========================================================================================== #
-
-	def get_path(self, section, key):
-		"""Resolve a path from settings.ini, expanding ${USER_PATH} placeholders.
-
-		Args:
-			section: INI section name (e.g. 'Paths').
-			key: INI key name (e.g. 'NinjaDir').
-
-		Returns:
-			Expanded absolute path string.
-		"""
-		return self.config.get(section, key).replace('${USER_PATH}', self.user_home)
-
-	# ---------------- Plugin Creation --------------------------------------------------------- #
-
-	def create_plugin(self):
-		"""Create a new plugin project from a template.
-
-		Steps:
-			1. Validate plugin name is not empty and project doesn't already exist
-			2. Generate CMakeLists.txt from template blocks
-			3. Copy CMakePresets.json and generate launch.vs.json for VS debugging
-			4. Copy and rename template source files (replacing placeholder names)
-			5. Create output directories (__Plugins__/<name>/)
-			6. Start subprocess, run CMake configure + Ninja build
-			7. Create the plugin loader op chain (in → cplusplus → out)
-			8. Lock creation parameters (unless dev_mode)
-
-		Raises:
-			ValueError: If the plugin name is empty.
-			FileExistsError: If the project directory already exists.
-		"""
-		name = self.Pluginname
-		if name == '':
-			raise ValueError("Plugin name is empty.")
-
-		self._log('Create', f"Creating new plugin project '{name}'...")
-
-		os.makedirs(self.plugin_projects_dir, exist_ok=True)
-
-		if os.path.exists(self.working_dir):
-			raise FileExistsError(
-				f"Directory {self.working_dir} already exists. "
-				"Rename plugin, change working directory or delete existing directory."
-			)
-
-		template_name = self.ownerComp.par.Plugintemplate.eval()
-		template_info = self.template_map.get(template_name)
-		self._log('Create', f"Using template '{template_name}' (type={template_info.get('type')})")
-
-		os.makedirs(self.working_dir)
-
-		try:
-			# --- Generate CMakeLists.txt from template blocks ---
-			cmake_text = template_info.get('assemble_cmake')()
-			cmake_text = cmake_text.replace('__PLUGIN_NAME__', self.Pluginname)
-			cmake_text = cmake_text.replace('__PLUGIN_TYPE__', f"'{template_info.get('type')}'")
-			cmake_text = cmake_text.replace('__PLUGIN_BUILDER_DIR__', f'"{self.PluginBuilderDir}"')
-
-			with open(f"{self.working_dir}/CMakeLists.txt", 'w') as f:
-				f.write(cmake_text)
-			self._log('Create', f"Generated CMakeLists.txt")
-
-			# --- Copy CMakePresets.json ---
-			shutil.copyfile(
-				f"{self.PluginBuilderDir}/source/CMakePresets.json",
-				f"{self.working_dir}/CMakePresets.json"
-			)
-			self._log('Create', f"Copied CMakePresets.json")
-
-			# --- Generate launch.vs.json (Visual Studio debug config) ---
-			with open(f"{self.PluginBuilderDir}/source/launch.vs.json", 'r') as f:
-				launch_vs_json = json.load(f)
-
-			project_name = self.TDProjectName
-			td_path = self.TDPath
-			for config in launch_vs_json['configurations']:
-				config['name'] = config['name'].replace('__TD_PROJECT_NAME__', project_name)
-				config['args'][0] = config['args'][0].replace('__TD_PROJECT_NAME__', project_name)
-				config['projectTarget'] = config['projectTarget'].replace('__PLUGIN_NAME__', self.Pluginname)
-				config['exe'] = config['exe'].replace('__TD_PATH__', td_path)
-
-			with open(f"{self.working_dir}/launch.vs.json", 'w') as f:
-				json.dump(launch_vs_json, f, indent=4)
-			self._log('Create', f"Generated launch.vs.json (TD project: '{project_name}')")
-
-			# --- Copy and rename template source files ---
-			os.makedirs(f"{self.working_dir}/source")
-			template_replace_name = template_info.get('replace')
-			template_source_dir = f"{self.template_dir}/{template_name}/source"
-			source_files = os.listdir(template_source_dir)
-			self._log('Create', f"Copying {len(source_files)} template source file(s) from {template_name}/source/")
-
-			for file_name in source_files:
-				with open(f"{template_source_dir}/{file_name}", 'r') as f:
-					text = f.read()
-
-				# Replace template class/file names with plugin name
-				text = text.replace(template_replace_name, self.Pluginname)
-
-				# For the main .cpp file, also replace operator metadata placeholders
-				if file_name == f"{template_replace_name}.cpp":
-					text = text.replace('#__OP_TYPE__#', self.Pluginname.capitalize())
-					text = text.replace('#__OP_LABEL__#', self.Pluginname)
-					text = text.replace('#__OP_ICON__#', self.Pluginname[:3].upper())
-					text = text.replace('#__OP_AUTHOR__#', self.config.get('PluginInfo', 'Author'))
-					text = text.replace('#__OP_EMAIL__#', self.config.get('PluginInfo', 'Email'))
-
-				file_name = file_name.replace(template_replace_name, self.Pluginname)
-
-				with open(f"{self.working_dir}/source/{file_name}", 'w') as f:
-					f.write(text)
-
-			# --- Create output directories ---
-			os.makedirs(self.plugins_dir, exist_ok=True)
-			os.makedirs(f"{self.plugin_dir}", exist_ok=True)
-			self._log('Create', f"Created output directories")
-
-			# --- Run initial build ---
-			if self.start_subprocess():
-				self.build_plugin()
-				self.compile_plugin()
-				self._log('Create', f"Initial build + compile triggered")
-
-		except Exception as e:
-			self._log('Create', f"ERROR: {e} — cleaning up project directory")
-			shutil.rmtree(self.working_dir)
-			raise e
-
-		# --- Create loader op chain ---
-		self.create_plugin_loader(template_info.get('type'))
-		run("args[0].PostCreatePlugin()", self.ownerComp, delayFrames=300)
-		if not self.dev_mode:
-			self.disable_create_pars()
-
-		self._log('Create', f"Plugin '{name}' created successfully")
-
-	def destroy_children(self):
-		"""Destroy all child ops except the core builder/source/CMakeLists components."""
-		children = self.ownerComp.findChildren(depth=1)
-		preserved = ['builder', 'source', 'CMakeLists']
-		for child in children:
-			if child.name not in preserved:
-				child.destroy()
-
-	def create_plugin_loader(self, plugin_type):
-		"""Create the plugin loader op chain (input → cplusplus loader → output).
-
-		Args:
-			plugin_type: One of 'CHOP', 'TOP', 'DAT', 'SOP'.
-		"""
-		self._log('Create', f"Creating plugin loader chain (type={plugin_type})")
-		self.destroy_children()
-
-		loader_op_info = self.loader_op_map.get(plugin_type)
-
-		# Create ops: optional input → loader → output
-		create_input_op = self.ownerComp.par.Createinputop.eval()
-		if create_input_op:
-			in_op = self.ownerComp.create(loader_op_info.get('in'), 'in1')
-		self.loader_op = self.ownerComp.create(loader_op_info.get('loader'), 'plugin_loader')
-		out_op = self.ownerComp.create(loader_op_info.get('out'), 'out1')
-
-		# Position ops in the network
-		if create_input_op:
-			in_op.nodeX = -200
-		self.loader_op.nodeX = 0
-		out_op.nodeX = 200
-
-		# Wire connections
-		if create_input_op:
-			in_op.outputConnectors[0].connect(self.loader_op.inputConnectors[0])
-		self.loader_op.outputConnectors[0].connect(out_op.inputConnectors[0])
-
-		# Configure loader — start unloaded, set plugin path
-		self.loader_op.par.unloadplugin = True
-		self.loader_op.par.plugin = f"{self.plugin_dir}/{self.Pluginname}.dll"
-
-		# Schedule custom parameter sync after loader initialization
-		run("args[0].ext.PluginBuilderExt.sync_custom_parameters()", self.ownerComp, delayFrames=15)
-
-	# ---------------- CMake Assembly ---------------------------------------------------------- #
-
-	def assemble_cmake_text_basic(self):
-		"""Assemble CMakeLists.txt for a basic plugin (CHOP/TOP/DAT/SOP)."""
-		return CMakeBlocks.start_block + CMakeBlocks.project_block + CMakeBlocks.core_block
-
-	def assemble_cmake_text_cuda(self):
-		"""Assemble CMakeLists.txt for a CUDA-enabled TOP plugin."""
-		return CMakeBlocks.start_block + CMakeBlocks.cuda_project_block + CMakeBlocks.core_block + CMakeBlocks.cuda_block
-
-	def assemble_cmake_text_python(self):
-		"""Assemble CMakeLists.txt for a CHOP plugin with embedded Python."""
-		return CMakeBlocks.start_block + CMakeBlocks.project_block + CMakeBlocks.core_block + CMakeBlocks.python_block
-
-	# ---------------- Build & Compile --------------------------------------------------------- #
-
-	def build_plugin(self):
-		"""Run CMake configure step (generates Ninja build files).
-
-		Sends the cmake command to the subprocess. Requires the working
-		directory and CMakeLists.txt to exist.
-
-		Raises:
-			FileNotFoundError: If the working directory doesn't exist.
-		"""
-		if not os.path.exists(self.abs_working_dir):
-			raise FileNotFoundError(f"Directory {self.abs_working_dir} does not exist.")
-
-		# Clean stale build cache if generator mismatched or non-Ninja cache detected
-		build_dir = os.path.join(self.abs_working_dir, 'build')
-		cache_file = os.path.join(build_dir, 'CMakeCache.txt')
-		if os.path.exists(cache_file):
-			try:
-				with open(cache_file, 'r', encoding='utf-8', errors='ignore') as f:
-					content = f.read()
-					if 'CMAKE_GENERATOR:INTERNAL=' in content and 'Ninja' not in content:
-						self._log('Build', "Detected non-Ninja CMake generator cache. Cleaning build directory...")
-						shutil.rmtree(build_dir, ignore_errors=True)
-			except Exception as e:
-				self._log('Build', f"Warning inspecting CMakeCache.txt: {e}")
-
-		if self.CMakeListsExists:
-			self._log('Build', "=========================================================")
-			self._log('Build', f"STARTING CMAKE CONFIGURE FOR PLUGIN: '{self.Pluginname}'")
-			self._log('Build', f"  - Target Plugin: '{self.Pluginname}'")
-			self._log('Build', f"  - Build Config:  '{self.build_config}'")
-			self._log('Build', f"  - Working Dir:   {self.abs_working_dir}")
-			self._log('Build', f"  - CMakeLists:    {self.CMakeListsPath} (EXISTS)")
-			self._log('Build', f"  - Executing:     {self.cmake_build_cmd}")
-			self.SendCommand(self.cmake_build_cmd)
-		else:
-			self._log('Build', f"SKIPPED — no CMakeLists.txt found at {self.CMakeListsPath}")
-
-	def compile_plugin(self):
-		"""Run Ninja build step (compiles the plugin DLL).
-
-		Sends the ninja command to the subprocess. Requires CMakeLists.txt
-		to exist (i.e., cmake configure must have been run first).
-		"""
-		if self.CMakeListsExists:
-			self._log('Compile', "=========================================================")
-			self._log('Compile', f"STARTING NINJA BUILD FOR PLUGIN: '{self.Pluginname}'")
-			self._log('Compile', f"  - Target Plugin: '{self.Pluginname}'")
-			self._log('Compile', f"  - Build Output:  {self.build_path}")
-			self._log('Compile', f"  - Executing:     {self.cmake_build_plugin_cmd}")
-			self.SendCommand(self.cmake_build_plugin_cmd)
-		else:
-			self._log('Compile', "SKIPPED — no CMakeLists.txt found")
-
-	def BuildAndCompile(self):
-		"""Run both CMake configure and Ninja build in sequence."""
-		self.build_plugin()
-		self.compile_plugin()
-
-	def RefreshDats(self):
-		"""Force-cook all file-watching DATs to pick up filesystem changes.
-
-		Called on a delay after initialization to ensure DATs reflect
-		the current state of the project files.
-		"""
-		self._log('Init', "Refreshing file-watching DATs...")
-		self.folder_binDat.cook(force=True)
-		self.folder_sourceDat.cook(force=True)
-		self.CMakeListsDat.cook(force=True)
-		self.sync_custom_parameters()
-
-	# ---------------- Cleanup ----------------------------------------------------------------- #
-
-	def clear_plugin_builder(self):
-		"""Unload the current plugin, destroy loader ops, and reset the plugin name.
-
-		Called when the Pluginname parameter is cleared.
-		"""
-		self._log('Cleanup', f"Clearing plugin builder (current: '{self.Pluginname}')")
-
-		self.loader_op = self.ownerComp.op('plugin_loader')
-		if self.loader_op is not None:
-			self.loader_op.par.unloadplugin = True
-			self.loader_op.cook(force=True)
-			self._log('Cleanup', "Plugin unloaded")
-
-		self.destroy_children()
-
-		# Reset parameters on 'Custom' page without deleting the tab
-		page = self._get_custom_page(self.ownerComp, 'Custom')
-		if page:
-			for p in list(page.pars):
-				try:
-					p.destroy()
-				except Exception:
-					pass
-
-		if self.Pluginname != '':
-			self.ownerComp.par.Pluginname = ''
-
-		self._log('Cleanup', "Plugin builder cleared")
-
-	# ---------------- Install ----------------------------------------------------------------- #
-
-	def install_plugin(self):
-		"""Install the plugin to TouchDesigner's user plugins directory."""
-		self._log('Install', "=========================================================")
-		self._log('Install', f"STARTING PLUGIN INSTALLATION FOR: '{self.Pluginname}'")
-		self._log('Install', f"  Step 1/4: Inspecting source directory ({self.plugin_dir})...")
-
-		if not os.path.exists(self.plugin_dir):
-			self._log('Install', f"  ERROR: Source folder {self.plugin_dir} does not exist. Aborting.")
-			return
-
-		src_files = []
-		for root, dirs, files in os.walk(self.plugin_dir):
-			for f in files:
-				src_files.append(os.path.join(root, f))
-		self._log('Install', f"  Source contains {len(src_files)} file(s):")
-		for f in src_files:
-			size = os.path.getsize(f)
-			self._log('Install', f"    - {f} ({size} bytes)")
-
-		install_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Derivative', 'Plugins')
-		self._log('Install', f"  Step 2/4: Resolving target installation folder...")
-		self._log('Install', f"    - Target Dir: {install_dir}")
-
-		if not os.path.exists(install_dir):
-			self._log('Install', f"  ERROR: Target folder {install_dir} does not exist. Aborting.")
-			return
-
-		loader_op = self.ownerComp.op('plugin_loader')
-		self._log('Install', f"  Step 3/4: Unloading plugin in loader op to release DLL file locks...")
-		if loader_op is not None:
-			loader_op.par.unloadplugin = True
-			loader_op.cook(force=True)
-			self._log('Install', f"    - Unloaded plugin from {loader_op.path}")
-		else:
-			self._log('Install', "    - WARNING: No plugin_loader op found, skipping unload.")
-
-		dest = os.path.join(install_dir, self.Pluginname)
-		self._log('Install', f"  Step 4/4: Copying binaries to user plugins directory...")
-		self._log('Install', f"    - Destination Path: {dest}")
-
-		def _force_copy(src, dst):
-			basename = os.path.basename(dst)
-			if os.path.exists(dst):
-				try:
-					os.remove(dst)
-					self._log('Install', f"    - Overwrote existing {basename}")
-				except PermissionError:
-					self._log('Install', f"    - {basename} is locked, renaming to .old...")
-					old = dst + '.old'
-					if os.path.exists(old):
-						try:
-							os.remove(old)
-						except PermissionError:
-							pass
-					try:
-						os.rename(dst, old)
-						self._log('Install', f"    - Renamed {basename} -> {basename}.old")
-					except OSError as e:
-						self._log('Install', f"    - ERROR: Could not rename locked file {dst}: {e}")
-			else:
-				self._log('Install', f"    - Copying new file: {basename}")
-
-			shutil.copy2(src, dst)
-			size = os.path.getsize(dst)
-			self._log('Install', f"    - Successfully copied {basename} ({size} bytes)")
-
-		shutil.copytree(self.plugin_dir, dest, dirs_exist_ok=True, copy_function=_force_copy)
-
-		if loader_op is not None:
-			self._log('Install', "  Re-loading plugin into TouchDesigner...")
-			loader_op.par.unloadplugin = False
-			if hasattr(loader_op.par, 'reinitpulse'):
-				loader_op.par.reinitpulse.pulse()
-			loader_op.cook(force=True)
-			run("args[0].ext.PluginBuilderExt.sync_custom_parameters(verbose=True)", self.ownerComp, delayFrames=15)
-
-		self._log('Install', f"INSTALLATION COMPLETE: Plugin '{self.Pluginname}' ready in Derivative/Plugins.")
-
-	# ---------------- Path Validation --------------------------------------------------------- #
-
-	def check_paths(self):
-		"""Validate that all required tool paths from settings.ini exist.
-
-		Checks:
-			- PluginBuilderDir (this repo's install location)
-			- NinjaDir (directory containing ninja.exe)
-			- VCVarsall (path to vcvarsall.bat for MSVC)
-
-		Returns:
-			True if all paths are valid.
-
-		Raises:
-			FileNotFoundError: If any required path doesn't exist.
-		"""
-		value = self.get_path('Paths', 'PluginBuilderDir')
-		if not os.path.exists(value):
-			raise FileNotFoundError(f"settings.ini [paths] PluginBuilderDir: {value} does not exist.")
-
-		value = self.get_path('Paths', 'NinjaDir')
-		if not os.path.exists(value):
-			raise FileNotFoundError(f"settings.ini [paths] NinjaDir: {value} does not exist.")
-
-		value = self.get_path('Paths', 'VCVarsall')
-		if not os.path.exists(value):
-			raise FileNotFoundError(f"settings.ini [paths] VCVarsall: {value} does not exist.")
-
-		return True
-
-	# ---------------- UI Helpers -------------------------------------------------------------- #
-
-	def disable_create_pars(self):
-		"""Lock plugin creation parameters (called after a plugin is created).
-
-		Prevents accidental changes to plugin name/template while a project
-		is active. Skipped in dev_mode.
-		"""
-		self.ownerComp.par.Createplugin.enable = False
-		self.ownerComp.par.Pluginname.readOnly = True
-		self.ownerComp.par.Plugintemplate.readOnly = True
-		self.ownerComp.par.Createinputop.enable = False
-
-	def PostCreatePlugin(self):
-		"""Deferred post-creation hook — refreshes the CMakeLists DAT.
-
-		Called ~300 frames after plugin creation to ensure the filesystem
-		has settled before the DAT tries to read the file.
-		"""
-		self.CMakeListsDat.cook(force=True)
-
-	def file_locked(self, filepath):
-		"""Check if a file is locked (in use by another process).
-
-		Attempts to open the file in binary mode with no buffering.
-		If a PermissionError is raised, the file is locked.
-
-		Args:
-			filepath: Path to the file to check.
-
-		Returns:
-			True if the file is locked, False otherwise (including if
-			the file doesn't exist).
-		"""
-		try:
-			with open(filepath, 'rb', buffering=0):
-				pass
-		except FileNotFoundError:
-			return False  # File doesn't exist — not "locked"
-		except (PermissionError, OSError):
-			return True   # File is locked by another process
-		return False
-
-	# ========================================================================================== #
-	#  EXTERNAL METHODS (promoted to component, callable from other ops)                         #
-	# ========================================================================================== #
-
-	def EnableCreatePars(self):
-		"""Unlock plugin creation parameters (re-enable the Create button)."""
-		self.ownerComp.par.Createplugin.enable = True
-		self.ownerComp.par.Pluginname.readOnly = False
-		self.ownerComp.par.Plugintemplate.readOnly = False
-		self.ownerComp.par.Createinputop.enable = True
-
-	# ========================================================================================== #
-	#  CUSTOM PARAMETER SYNC                                                                     #
-	# ========================================================================================== #
-
-	@staticmethod
-	def _get_custom_page(op, page_name):
-		"""Retrieve a custom page by name from an operator, or None if not found."""
-		if op is None or not getattr(op, 'valid', True):
-			return None
-		for page in getattr(op, 'customPages', []):
-			if page.name == page_name:
-				return page
-		return None
-
-	@staticmethod
-	def _copy_par_attributes(src_p, dst_p):
-		"""Safely copy attributes from source parameter to destination parameter."""
-		attrs = ['default', 'min', 'max', 'normMin', 'normMax', 'clampMin', 'clampMax', 'val', 'enable', 'readOnly']
-		for attr in attrs:
-			if hasattr(src_p, attr):
-				try:
-					setattr(dst_p, attr, getattr(src_p, attr))
-				except Exception:
-					pass
-		if hasattr(src_p, 'menuNames') and hasattr(dst_p, 'menuNames'):
-			try:
-				if hasattr(src_p, 'menuLabels') and hasattr(dst_p, 'menuLabels'):
-					dst_p.menuLabels = src_p.menuLabels
-				dst_p.menuNames = src_p.menuNames
-			except Exception:
-				try:
-					dst_p.menuNames = src_p.menuNames
-					if hasattr(src_p, 'menuLabels') and hasattr(dst_p, 'menuLabels'):
-						dst_p.menuLabels = src_p.menuLabels
-				except Exception:
-					pass
-
-	def _sync_single_parameter(self, loader_par, page, target_comp):
-		"""Dynamically mirror a single parameter from loader_par onto target_comp's page.
-
-		Adapts to newly created, renamed, or modified parameters by inspecting
-		parameter style, size, bounds, menus, bindings, and enablement across all
-		tuple components.
-		"""
-		par_name = loader_par.name
-		label = getattr(loader_par, 'label', par_name)
-		style = getattr(loader_par, 'style', '')
-		is_pulse = getattr(loader_par, 'isPulse', False) or style == 'Pulse'
-
-		# Determine tuple size if available
-		size = 1
-		if hasattr(loader_par, 'tuple') and loader_par.tuple:
-			try:
-				size = len(loader_par.tuple)
-			except Exception:
-				size = 1
-
-		existing = getattr(target_comp.par, par_name, None)
-		existing_page_name = getattr(getattr(existing, 'page', None), 'name', '') if existing is not None else ''
-
-		# Detect style/type mismatch between existing parameter and C++ loader parameter
-		if existing is not None:
-			src_style = getattr(loader_par, 'style', '')
-			dst_style = getattr(existing, 'style', '')
-
-			src_is_menu = getattr(loader_par, 'isMenu', False) or src_style in ('Menu', 'StrMenu', 'IntMenu')
-			dst_is_menu = getattr(existing, 'isMenu', False) or dst_style in ('Menu', 'StrMenu', 'IntMenu')
-
-			src_is_float = getattr(loader_par, 'isFloat', False) or src_style == 'Float'
-			dst_is_float = getattr(existing, 'isFloat', False) or dst_style == 'Float'
-
-			src_is_int = getattr(loader_par, 'isInt', False) or src_style == 'Int'
-			dst_is_int = getattr(existing, 'isInt', False) or dst_style == 'Int'
-
-			src_is_toggle = getattr(loader_par, 'isToggle', False) or src_style == 'Toggle'
-			dst_is_toggle = getattr(existing, 'isToggle', False) or dst_style == 'Toggle'
-
-			if (src_is_menu != dst_is_menu or
-				src_is_float != dst_is_float or
-				src_is_int != dst_is_int or
-				is_pulse != (getattr(existing, 'isPulse', False) or dst_style == 'Pulse') or
-				src_is_toggle != dst_is_toggle):
-				try:
-					existing.destroy()
-				except Exception:
-					pass
-				existing = None
-
-		# Create parameter dynamically if missing, mismatched type, or not on target page
-		if existing is None or existing_page_name != page.name:
-			try:
-				if getattr(loader_par, 'isFloat', False) or style == 'Float':
-					res = page.appendFloat(par_name, label=label, size=size)
-				elif getattr(loader_par, 'isInt', False) or style == 'Int':
-					res = page.appendInt(par_name, label=label, size=size)
-				elif getattr(loader_par, 'isToggle', False) or style == 'Toggle':
-					res = page.appendToggle(par_name, label=label, size=size)
-				elif getattr(loader_par, 'isMenu', False) or style in ('Menu', 'StrMenu', 'IntMenu'):
-					try:
-						res = page.appendMenu(par_name, label=label)
-					except Exception:
-						res = page.appendStr(par_name, label=label)
-				elif is_pulse:
-					res = page.appendPulse(par_name, label=label)
-				elif getattr(loader_par, 'isStr', False) or getattr(loader_par, 'isString', False) or style in ('Str', 'String'):
-					res = page.appendStr(par_name, label=label)
-				elif getattr(loader_par, 'isHeader', False) or style == 'Header':
-					res = page.appendHeader(par_name, label=label)
-				elif style == 'XYZ':
-					res = page.appendXYZ(par_name, label=label)
-				elif style == 'UV':
-					res = page.appendUV(par_name, label=label)
-				elif style == 'RGB':
-					res = page.appendRGB(par_name, label=label)
-				elif style == 'RGBA':
-					res = page.appendRGBA(par_name, label=label)
-				else:
-					try:
-						res = page.appendStr(par_name, label=label)
-					except Exception:
-						res = page.appendPar(par_name, label=label)
-
-				if isinstance(res, (list, tuple)):
-					existing = res[0]
-				else:
-					existing = res
-			except Exception as e:
-				self._log('ParamSync', f"  ERROR creating dynamic parameter '{par_name}': {e}")
-				return None
-
-		# Collect destination tuple elements and source tuple elements
-		if hasattr(existing, 'tuple') and existing.tuple:
-			dst_pars = list(existing.tuple)
-		else:
-			dst_pars = [existing]
-
-		if hasattr(loader_par, 'tuple') and loader_par.tuple:
-			src_pars = list(loader_par.tuple)
-		else:
-			src_pars = [loader_par]
-
-		# Process attribute copying and binding across all vector components
-		for src_p, dst_p in zip(src_pars, dst_pars):
-			if dst_p is not None:
-				self._copy_par_attributes(src_p, dst_p)
-				default_val = repr(getattr(src_p, 'default', 0))
-				safe_bind = f"me.op('{self.loader_op.name}').par.{dst_p.name} if me.op('{self.loader_op.name}') is not None else {default_val}"
-
-				try:
-					dst_p.enable = getattr(src_p, 'enable', True)
-					dst_p.readOnly = getattr(src_p, 'readOnly', False)
-					if is_pulse:
-						if hasattr(dst_p, 'bindExpr'):
-							dst_p.bindExpr = ''
-					else:
-						if hasattr(dst_p, 'bindExpr'):
-							dst_p.bindExpr = safe_bind
-						try:
-							if hasattr(td, 'ParMode'):
-								dst_p.mode = td.ParMode.BIND
-						except Exception:
-							pass
-						if hasattr(src_p, 'val'):
-							dst_p.val = src_p.val
-						elif hasattr(src_p, 'eval'):
-							dst_p.val = src_p.eval()
-				except Exception:
-					pass
-
-		return existing
-
-	def sync_custom_parameters(self, force_rebuild=False, verbose=False):
-		"""Sync custom parameters from plugin_loader onto ownerComp's 'Custom' tab.
-
-		Mirrors all custom parameters from the plugin_loader operator (e.g. CPlusPlus CHOP)
-		onto a 'Custom' parameter page on ownerComp. Establishes parameter bindings and
-		synchronizes values.
-		"""
-		# Always ensure the 'Custom' page tab exists on ownerComp
-		page = self._get_custom_page(self.ownerComp, 'Custom')
-		if not page:
-			try:
-				page = self.ownerComp.appendCustomPage('Custom')
-			except Exception as e:
-				self._log('ParamSync', f"Could not create 'Custom' page: {e}")
-				return
-
-		self.loader_op = self.ownerComp.op('plugin_loader')
-		if self.loader_op is None or not getattr(self.loader_op, 'valid', True):
-			return
-
-		# Force cook on loader_op so TouchDesigner updates parameter definitions
-		try:
-			self.loader_op.cook(force=True)
-		except Exception:
-			pass
-
-		# Built-in parameters of CPlusPlus OPs to exclude
-		built_in_pars = {
-			'unloadplugin', 'plugin', 'reinit', 'reinitpulse',
-			'timeslice', 'scope', 'srselect', 'exportmethod',
-			'autoexportroot', 'exporttable', 'commonrenamefrom', 'commonrenameto',
-			'outputresolution', 'resolutionw', 'resolutionh', 'aspect', 'aspectw', 'aspecth',
-			'fill', 'filter', 'coord', 'format', 'pixelformat', 'colorformat',
-			'pageindex', 'renamefrom', 'renameto'
-		}
-
-		# Collect custom C++ plugin parameters from plugin_loader (must start with uppercase letter)
-		loader_custom_pars = []
-		seen_names = set()
-		try:
-			all_pars = self.loader_op.pars()
-		except Exception:
-			all_pars = []
-
-		for p in all_pars:
-			par_name = p.name.lower()
-			is_custom_par = getattr(p, 'isCustom', False) or (p.name and p.name[0].isupper())
-			if is_custom_par and par_name not in built_in_pars:
-				if p.name not in seen_names:
-					seen_names.add(p.name)
-					loader_custom_pars.append(p)
-
-		current_page_par_names = [p_custom.name for p_custom in getattr(page, 'pars', [])]
-		expected_par_names = [p.name for p in loader_custom_pars]
-
-		# If force_rebuild is requested OR if parameter order/names mismatch, clean page first to preserve exact C++ declaration order
-		if (force_rebuild or current_page_par_names != expected_par_names) and page and hasattr(page, 'pars'):
-			for p_custom in list(page.pars):
-				try:
-					p_custom.destroy()
-				except Exception:
-					pass
-
-		loader_par_names = {p.name for p in loader_custom_pars}
-
-		# Remove any parameters on 'Custom' page that no longer exist on plugin_loader
-		if page and hasattr(page, 'pars'):
-			for p_custom in list(page.pars):
-				if p_custom.name not in loader_par_names:
-					try:
-						p_custom.destroy()
-					except Exception:
-						pass
-
-		# Ensure all pulse parameters on 'Custom' page have empty bindExpr
-		if page and hasattr(page, 'pars'):
-			for p_custom in page.pars:
-				if getattr(p_custom, 'isPulse', False) or getattr(p_custom, 'style', '') == 'Pulse':
-					try:
-						if hasattr(p_custom, 'bindExpr'):
-							p_custom.bindExpr = ''
-					except Exception:
-						pass
-
-		for p in loader_custom_pars:
-			self._sync_single_parameter(p, page, self.ownerComp)
-
-		final_pars = [p_custom.name for p_custom in getattr(page, 'pars', [])]
-		last_synced = getattr(self, '_last_synced_pars', None)
-		if verbose or final_pars != last_synced:
-			self._log('ParamSync', "=========================================================")
-			self._log('ParamSync', f"DYNAMIC PARAMETER SYNC COMPLETE ON 'Custom' TAB:")
-			self._log('ParamSync', f"  - Active Custom Parameters: {len(loader_custom_pars)}")
-			for idx, p in enumerate(loader_custom_pars, start=1):
-				style = getattr(p, 'style', 'Par')
-				val = getattr(p, 'val', getattr(p, 'eval', lambda: '')())
-				is_pulse = getattr(p, 'isPulse', False) or style == 'Pulse'
-				mode_str = "OnParPulse" if is_pulse else f"BIND -> {self.loader_op.name}.par.{p.name}"
-				self._log('ParamSync', f"  {idx}. {p.name:<14} [{style:<6}] val={val!r:<10} ({mode_str})")
-			self._log('ParamSync', "=========================================================")
-			self._last_synced_pars = final_pars
-
-	# ========================================================================================== #
-	#  PARAMETER CALLBACKS                                                                       #
-
-	def OnParValueChange(self, par, prev):
-		"""Dispatch parameter value changes to registered handlers."""
-		if par.name in self.on_par_value_change_map:
-			self.on_par_value_change_map[par.name](par.eval(), prev)
-		elif self.loader_op is not None and getattr(self.loader_op, 'valid', True):
-			loader_par = getattr(self.loader_op.par, par.name, None)
-			if loader_par is not None:
-				try:
-					loader_par.val = par.eval()
-				except Exception:
-					pass
-
-	def OnParPulse(self, par):
-		"""Dispatch parameter pulse events to registered handlers."""
-		if par.name in self.on_par_pulse_map:
-			self.on_par_pulse_map[par.name]()
-		elif self.loader_op is not None and getattr(self.loader_op, 'valid', True):
-			loader_par = getattr(self.loader_op.par, par.name, None)
-			if loader_par is not None and getattr(loader_par, 'isPulse', False):
-				try:
-					loader_par.pulse()
-				except Exception:
-					pass
-
-	def onOutputto(self, value, prev):
-		"""Handle Outputto parameter change — restart subprocess with new output mode."""
-		self._log('Subprocess', f"Output mode changed: '{prev}' → '{value}', restarting subprocess...")
-		self.close_subprocess()
-		self.start_subprocess()
-
-	def onPluginname(self, value, prev):
-		"""Handle Pluginname parameter change.
-
-		If cleared: unloads the current plugin and clears the builder.
-		If set to a name with an existing CMakeLists.txt: loads the plugin
-		project by reading the plugin type from the CMake header comment
-		and creating the appropriate loader op chain.
-		"""
-		if value == '':
-			self._log('Init', f"Plugin name cleared (was '{prev}'), clearing builder...")
-			self.clear_plugin_builder()
-		elif os.path.exists(self.CMakeListsPath):
-			# Try to read plugin type from the CMakeLists.txt header comment
-			# Format: # {'plugin_type': 'CHOP'}
-			with open(self.CMakeListsPath, 'r') as f:
-				first_line = f.readline()
-			if first_line.startswith('#'):
-				info = None
-				try:
-					info = ast.literal_eval(first_line[2:].strip())
-				except Exception:
-					pass
-				if info is not None and isinstance(info, dict):
-					plugin_type = info.get('plugin_type')
-					if plugin_type is not None:
-						self._log('Init', f"Loading existing PluginProject: '{self.Pluginname}' (type={plugin_type})")
-						self.create_plugin_loader(plugin_type)
-						self.start_subprocess()
-						self.sync_custom_parameters(verbose=True)
-						return
-
-		# Fallback: just update loader reference and refresh DATs
-		self.loader_op = self.ownerComp.op('plugin_loader')
-		if self.loader_op is not None:
-			self.loader_op.par.unloadplugin = True
-			self.loader_op.cook(force=True)
-			self._log('Init', f"Unloaded existing plugin loader for '{value}'")
-
-		self.RefreshDats()
-
-	# ========================================================================================== #
-	#  FILE CHANGE CALLBACKS                                                                     #
-	# ========================================================================================== #
-
-	def OnPluginUpdate(self):
-		"""Handle file changes in the build output directory (debounced).
-
-		Called by the folder_bin DAT whenever any file changes in the
-		build output directory. This fires for .obj files, .dll files,
-		and other build artifacts.
-
-		To avoid copying a stale DLL mid-build, this method debounces:
-		each call cancels any previously scheduled copy and schedules
-		a new one 10 frames later. This ensures rapid events (.obj
-		compile → DLL link) collapse into a single copy of the final
-		linked DLL.
-		"""
-		if self.loader_op is None or self.Pluginname == '':
-			return
-
-		build_path = self.build_path
-
-		# Only react if the DLL exists — ignore .obj and other artifact changes
-		if not os.path.exists(build_path):
-			self._log('Build→Copy', f"DLL not yet produced ({build_path}), waiting for linker...")
-			return
-
-		# Cancel any previously scheduled copy — the latest trigger wins
-		for r in runs:
-			if r.group == 'copy_dll':
-				r.kill()
-
-		# Reset retry counter for a fresh build event
-		self.open_attempts = 0
-
-		# Record the DLL's current modification time to detect linker updates during debounce
-		self._build_mtime = os.path.getmtime(build_path)
-
-		self._log('Build→Copy', "File change detected, scheduling copy in 10 frames (debounce)...")
-		run("args[0].ext.PluginBuilderExt._do_copy_plugin()", self.ownerComp, group='copy_dll', delayFrames=10)
-
-	def _do_copy_plugin(self):
-		"""Execute the actual DLL copy after the debounce delay.
-
-		Copies the built DLL from the build output directory to the
-		__Plugins__/ directory, then reloads it in the plugin_loader op.
-
-		If files are still locked (e.g. linker hasn't released the DLL),
-		retries up to 20 times with 5-frame delays between attempts.
-		"""
-		if self.loader_op is None or self.Pluginname == '':
-			self._log('Build→Copy', f"Skipped: loader_op={self.loader_op}, Pluginname='{self.Pluginname}'")
-			return
-
-		self._log('Build→Copy', f"Debounce elapsed — executing copy for '{self.Pluginname}'")
-
-		plugin_name = self.Pluginname
-		build_path = self.build_path
-		plugin_path = f"{self.plugin_dir}/{plugin_name}.dll"
-
-		# --- Debug: source file info ---
-		self._log('Build→Copy', f"build_path (source): {build_path}")
-		self._log('Build→Copy', f"  exists: {os.path.exists(build_path)}")
-		if os.path.exists(build_path):
-			size = os.path.getsize(build_path)
-			mtime = os.path.getmtime(build_path)
-			locked = self.file_locked(build_path)
-			self._log('Build→Copy', f"  size: {size} bytes")
-			self._log('Build→Copy', f"  mtime: {mtime}")
-			self._log('Build→Copy', f"  locked: {locked}")
-
-			# Detect if the linker updated the DLL during our debounce wait
-			expected_mtime = getattr(self, '_build_mtime', None)
-			if expected_mtime is not None and mtime > expected_mtime:
-				self._log('Build→Copy', f"  DLL was updated during debounce (mtime {expected_mtime} → {mtime}), using latest.")
-
-		# --- Debug: destination file info ---
-		self._log('Build→Copy', f"plugin_path (dest):  {plugin_path}")
-		self._log('Build→Copy', f"  exists: {os.path.exists(plugin_path)}")
-		if os.path.exists(plugin_path):
-			self._log('Build→Copy', f"  size: {os.path.getsize(plugin_path)} bytes")
-			self._log('Build→Copy', f"  locked: {self.file_locked(plugin_path)}")
-
-		if not os.path.exists(build_path):
-			self._log('Build→Copy', f"ERROR: Build output {build_path} does not exist. Aborting.")
-			return
-
-		# --- Unload plugin to release file locks ---
-		self.loader_op.par.unloadplugin = True
-		self.loader_op.cook(force=True)
-		self._log('Build→Copy', "Unloaded plugin via plugin_loader")
-
-		# --- Retry if files are still locked ---
-		if self.file_locked(build_path) or self.file_locked(plugin_path):
-			if self.open_attempts < 20:
-				self.open_attempts += 1
-				self._log('Build→Copy', f"File is locked (attempt {self.open_attempts}/20). Retrying in 5 frames...")
-				run("args[0].ext.PluginBuilderExt._do_copy_plugin()", self.ownerComp, group='copy_dll', delayFrames=5)
-				return
-			else:
-				self._log('Build→Copy', f"ERROR: File still locked after {self.open_attempts} attempts. Giving up.")
-				self.open_attempts = 0
-				return
-
-		self.open_attempts = 0
-		self._log('Build→Copy', "Files are unlocked, proceeding with copy.")
-
-		# --- Ensure plugin output directory exists ---
-		if not os.path.exists(self.plugin_dir):
-			os.makedirs(self.plugin_dir)
-			self._log('Build→Copy', f"Created plugin directory: {self.plugin_dir}")
-
-		# --- Copy the DLL ---
-		shutil.copyfile(build_path, plugin_path)
-		self._log('Build→Copy', f"Copied {build_path} → {plugin_path}")
-
-		# --- Verify and reload ---
-		if os.path.exists(plugin_path):
-			self._log('Build→Copy', f"  Verified: {plugin_path} ({os.path.getsize(plugin_path)} bytes)")
-			self.loader_op.par.plugin = plugin_path
-			self.loader_op.par.unloadplugin = False
-			if hasattr(self.loader_op.par, 'reinitpulse'):
-				self.loader_op.par.reinitpulse.pulse()
-			self.loader_op.cook(force=True)
-			self._log('Build→Copy', f"Plugin reloaded from {plugin_path}")
-			run("args[0].ext.PluginBuilderExt.sync_custom_parameters(force_rebuild=True, verbose=True)", self.ownerComp, delayFrames=15)
-		else:
-			self._log('Build→Copy', f"ERROR: Copy failed, {plugin_path} does not exist after copy.")
-
-	def OnSourceUpdate(self):
-		"""Handle source file changes — triggers a recompile.
-
-		Called by the folder_source DAT when any .cpp/.h file changes
-		in the plugin's source directory.
-		"""
-		self._log('Source', f"Source file changed, recompiling '{self.Pluginname}'...")
-		self.compile_plugin()
-
-	def OnCMakeListsUpdate(self):
-		"""Handle CMakeLists.txt changes — triggers a CMake reconfigure.
-
-		Called by the CMakeLists DAT when CMakeLists.txt is modified.
-		Re-runs the cmake configure step to regenerate Ninja build files.
-		"""
-		if not os.path.exists(self.CMakeListsPath):
-			self._log('CMake', f"CMakeLists.txt not found at {self.CMakeListsPath}")
-			return
-
-		self._log('CMake', f"CMakeLists.txt changed, re-running CMake configure...")
-		self.build_plugin()
-
-	# ========================================================================================== #
-	#  SUBPROCESS MANAGEMENT                                                                     #
-	# ========================================================================================== #
-
-	def start_subprocess(self):
-		"""Start the persistent cmd.exe build subprocess.
-
-		The subprocess runs vcvarsall.bat to initialize the MSVC environment,
-		then stays open to receive cmake/ninja commands via stdin. Output
-		can be directed to either TouchDesigner's text console (direct stdout)
-		or captured to a queue for display in TD's textport.
-
-		Returns:
-			True if the subprocess started successfully, False if the
-			working directory doesn't exist.
-		"""
-		# Bail if working directory doesn't exist yet
-		if not os.path.exists(self.abs_working_dir):
-			self._log('Subprocess', f"Cannot start — working dir does not exist: {self.abs_working_dir}")
-			return False
-
-		mode = self.ownerComp.par.Outputto.eval()
-		cmd = self.start_subprocess_base_cmd
-		self._log('Subprocess', f"Starting subprocess (mode={mode}, cwd={self.abs_working_dir})")
-
-		if mode == 'TOUCH_TEXT_CONSOLE':
-			# Direct output to TD's system console
-			self.process = subprocess.Popen(
-				cmd,
-				stdin=subprocess.PIPE,
-				text=True,
-				shell=True,
-				cwd=self.abs_working_dir
-			)
-		else:
-			# Capture output to a queue for textport display
-			self.process = subprocess.Popen(
-				cmd,
-				stdin=subprocess.PIPE,
-				stdout=subprocess.PIPE,
-				stderr=subprocess.STDOUT,
-				text=True,
-				shell=True,
-				bufsize=1,  # Line-buffered for real-time output
-				cwd=self.abs_working_dir
-			)
-
-			self.queue = queue.Queue()
-			self.output_thread = threading.Thread(target=self._output_reader, daemon=True)
-			self.output_thread.start()
-
-		started = self.process.returncode is None
-		self._log('Subprocess', f"Subprocess {'started' if started else 'FAILED to start'} (pid={self.process.pid})")
-		return started
-
-	def _output_reader(self):
-		"""Background thread: reads subprocess stdout line-by-line into the queue.
-
-		Runs in a daemon thread. Each line from the subprocess is placed
-		into self.queue for later retrieval by GetOutput()/PrintOutput().
-		"""
-		for line in self.process.stdout:
-			self.queue.put(line)
-
-	def SendCommand(self, command):
-		"""Send a command string to the build subprocess.
-
-		Writes the command followed by a newline to the subprocess's stdin
-		and flushes to ensure it's sent immediately. If the subprocess is not
-		running, attempts to start it first.
-
-		Args:
-			command: The shell command to execute (e.g. 'ninja -C build').
-
-		Raises:
-			RuntimeError: If the subprocess is not running and cannot be started.
-		"""
-		if self.process is None or self.process.poll() is not None:
-			self._log('Subprocess', "Subprocess not active. Attempting to start process before sending command...")
-			if not self.start_subprocess():
-				raise RuntimeError("Build subprocess is not active and could not be started.")
-
-		if self.process is not None and self.process.poll() is None:
-			self.process.stdin.write(command + '\n')
-			self.process.stdin.flush()
-		else:
-			raise RuntimeError("Subprocess is not running.")
-
-	def CheckAndPrintOutput(self):
-		"""Print any pending subprocess output (no-op if queue is empty)."""
-		if self.queue is None or self.queue.empty():
-			return
-		self.PrintOutput()
-
-	def GetOutput(self):
-		"""Retrieve all pending output lines from the subprocess queue.
-
-		Returns:
-			List of output line strings. Empty if no output is pending.
-		"""
-		output_lines = []
-		while not self.queue.empty():
-			output_lines.append(self.queue.get_nowait())
-		return output_lines
-
-	def PrintOutput(self):
-		"""Print all pending subprocess output to TD's textport."""
-		output_lines = self.GetOutput()
-		for line in output_lines:
-			print(line, end='')
-
-	def close_subprocess(self):
-		"""Terminate the build subprocess and clean up resources.
-
-		Closes stdin/stdout/stderr, terminates the process, and joins
-		the output reader thread. Safe to call multiple times.
-		"""
-		if self.process is not None:
-			self._log('Subprocess', f"Closing subprocess (pid={self.process.pid})...")
-
-			if self.process.poll() is None:  # Still running
-				if self.process.stdin is not None:
-					self.process.stdin.close()
-				if self.process.stdout is not None:
-					self.process.stdout.close()
-				if self.process.stderr is not None:
-					self.process.stderr.close()
-
-				self.process.terminate()
-				self._log('Subprocess', "Process terminated.")
-				del(self.process)
-				self.process = None
-
-		if hasattr(self, "output_thread") and self.output_thread.is_alive():
-			self.output_thread.join()
-			self._log('Subprocess', "Output reader thread joined.")
+    """
+    Creates, builds, compiles, hot-reloads and installs C++ plugins for TouchDesigner.
+
+    Lifecycle:
+        1. create_plugin()   — scaffold a project from a template (CMakeLists via TDPlugin.cmake, plugin.json,
+                               .vscode/, launch.vs.json) and start the first configure+build
+        2. build_plugin()    — cmake configure (Ninja)                      [BuildRunner job]
+        3. compile_plugin()  — ninja build                                   [BuildRunner job]
+        4. _do_copy_plugin() — hash-gated, rename-in-place copy of the DLL (+ runtime DLLs) into __Plugins__/
+                               and re-init of the plugin_loader op; then parameter sync
+        5. install_plugin()  — copy to ~/Documents/Derivative/Plugins/<name>/
+    """
+
+    # ========================================================================================== #
+    #  INITIALIZATION                                                                            #
+    # ========================================================================================== #
+
+    def __init__(self, ownerComp):
+        self.ownerComp = ownerComp
+        self.builderComp = ownerComp.op('builder')
+        self.SettingsDat = self.builderComp.op('settings')
+        self.folder_binDat = self.builderComp.op('folder_bin')
+        self.sourceComp = ownerComp.op('source')
+        self.folder_sourceDat = self.sourceComp.op('sync/folder_source') if self.sourceComp else None
+        self.CMakeListsDat = self.ownerComp.op('CMakeLists')
+
+        self.user_home = os.environ.get('USERPROFILE', os.environ.get('HOME', ''))
+
+        # --- settings (never raises) ---
+        settings_text = self.SettingsDat.text if self.SettingsDat is not None else ''
+        pb_dir_hint = self._peek_plugin_builder_dir(settings_text)
+        self.core = _import_support_module('PluginBuilderCore', pb_dir_hint)
+        self.cmake_blocks = _import_support_module('CMakeBlocks', pb_dir_hint)
+        self.settings = self.core.parse_settings(settings_text, self.user_home)
+        self.dev_mode = self.settings['dev_mode']
+        self.verbose = str(self.settings['options'].get('LogLevel', 'info')).lower() == 'debug'
+        self.mirror_pages = str(self.settings['options'].get('MirrorPages', 'true')).lower() not in ('0', 'false', 'no')
+
+        # --- state ---
+        self.runner = None
+        self.process = None                     # legacy attribute (some callbacks test it)
+        self.queue = None
+        self.loader_op = self.ownerComp.op('plugin_loader')
+        self.open_attempts = 0
+        self._build_mtime = None
+        self._last_copied_hash = None
+        self._last_synced_sig = None
+        self._last_synced_pars = None
+        self._rebuild_after_current = False
+        self._poll_scheduled = False
+        self._last_status = ''
+        self._last_configure_hash = None
+        self._loaded_dll_hash = None
+
+        # --- dispatch maps ---
+        self.on_par_value_change_map = {
+            'Outputto': self.onOutputto,
+            'Pluginname': self.onPluginname,
+        }
+        self.on_par_pulse_map = {
+            'Createplugin': self.create_plugin,
+            'Buildplugin': self.build_plugin,
+            'Compileplugin': self.compile_plugin,
+            'Closesubprocess': self.close_subprocess,
+            'Installplugin': self.install_plugin,
+            'Refreshcustompars': lambda: self.sync_custom_parameters(force_rebuild=True, verbose=True),
+            'Cancelbuild': self.cancel_build,
+            'Cleanbuild': self.clean_build,
+            'Runtests': self.run_tests,
+            'Reloadplugin': lambda: self._do_copy_plugin(force=True),
+        }
+
+        # --- loader op types by plugin family (POP guarded: older TD builds have no POPs) ---
+        self.loader_op_map = {
+            'CHOP': {'loader': cplusplusCHOP, 'in': inCHOP, 'out': outCHOP},
+            'TOP':  {'loader': cplusplusTOP,  'in': inTOP,  'out': outTOP},
+            'DAT':  {'loader': cplusplusDAT,  'in': inDAT,  'out': outDAT},
+            'SOP':  {'loader': cplusplusSOP,  'in': inSOP,  'out': outSOP},
+        }
+        pop_loader = globals().get('cplusplusPOP')
+        if pop_loader is not None:
+            self.loader_op_map['POP'] = {'loader': pop_loader, 'in': globals().get('inPOP'), 'out': globals().get('outPOP')}
+
+        # --- directory conventions ---
+        self.plugin_projects_dir = 'PluginProjects'
+        self.plugins_dir = '__Plugins__'
+
+        # --- toolchain & paths ---
+        self.PathsValid = False
+        self.toolchain = {'vcvarsall': '', 'ninja_dir': '', 'cmake_dir': '', 'errors': [], 'sources': {}}
+        self.check_paths()
+
+        # --- templates ---
+        self.templates = self.core.load_templates(self.template_dir) if self.PluginBuilderDir else {}
+        self.template_map = {name: {'type': m['family'], 'replace': m.get('replace', name), 'meta': m}
+                             for name, m in self.templates.items()}
+        self._populate_template_menu()
+
+        # --- SDK version check against the running TouchDesigner ---
+        self.sdk_versions = self.core.read_sdk_versions(self.include_dir) if self.PluginBuilderDir else {}
+        self._check_sdk_versions()
+
+        # --- status parameters (created dynamically; harmless if they already exist) ---
+        self._ensure_status_pars()
+
+        # --- deferred DAT refresh + parameter sync ---
+        run("args[0].RefreshDats()", self.ownerComp, delayFrames=120)
+        self.sync_custom_parameters()
+
+        self._log('Init', f"PluginBuilderExt initialized (dev_mode={self.dev_mode}, paths_valid={self.PathsValid}, "
+                          f"plugin='{self.Pluginname}', templates={len(self.templates)}, sdk={self.sdk_versions})")
+        if self.settings['errors']:
+            for e in self.settings['errors']:
+                self._log('Init', f'WARNING: {e}')
+        if not self.PathsValid:
+            self._set_status('Toolchain not configured — see textport')
+
+    def __del__(self):
+        try:
+            self.close_subprocess()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ========================================================================================== #
+    #  LOGGING / STATUS                                                                          #
+    # ========================================================================================== #
+
+    @staticmethod
+    def _log(tag, message):
+        print(f"[{tag}] {message}")
+
+    def _debug(self, tag, message):
+        if self.verbose:
+            print(f"[{tag}] {message}")
+
+    def _ensure_status_pars(self):
+        try:
+            page = None
+            for p in self.ownerComp.customPages:
+                if p.name == STATUS_PAGE:
+                    page = p
+                    break
+            if page is None:
+                page = self.ownerComp.appendCustomPage(STATUS_PAGE)
+            existing = {p.name for p in page.pars}
+            if 'Buildstatus' not in existing:
+                page.appendStr('Buildstatus', label='Build Status')[0].readOnly = True
+            if 'Lastbuild' not in existing:
+                page.appendStr('Lastbuild', label='Last Build')[0].readOnly = True
+            if 'Loadeddll' not in existing:
+                page.appendStr('Loadeddll', label='Loaded DLL')[0].readOnly = True
+            if 'Cancelbuild' not in existing:
+                page.appendPulse('Cancelbuild', label='Cancel Build')
+            if 'Cleanbuild' not in existing:
+                page.appendPulse('Cleanbuild', label='Clean Build Dir')
+            if 'Reloadplugin' not in existing:
+                page.appendPulse('Reloadplugin', label='Force Reload Plugin')
+            if 'Runtests' not in existing:
+                page.appendPulse('Runtests', label='Run Tests (ctest)')
+        except Exception as e:  # noqa: BLE001
+            self._debug('Init', f'status pars not created: {e}')
+
+    def _set_status(self, text):
+        self._last_status = text
+        try:
+            self.ownerComp.par.Buildstatus = text
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _set_error(self, message):
+        self._log('Build', f'ERROR: {message}')
+        for fn in ('addError', 'addScriptError'):
+            try:
+                getattr(self.ownerComp, fn)(message)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+
+    def _set_warning(self, message):
+        self._log('Build', f'WARNING: {message}')
+        for fn in ('addWarning', 'addScriptWarning'):
+            try:
+                getattr(self.ownerComp, fn)(message)
+                break
+            except Exception:  # noqa: BLE001
+                continue
+
+    def _clear_errors(self):
+        for fn in ('clearScriptErrors',):
+            try:
+                getattr(self.ownerComp, fn)(recurse=False)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _errors_dat(self):
+        dat = self.builderComp.op('build_errors')
+        if dat is None:
+            try:
+                dat = self.builderComp.create(tableDAT, 'build_errors')
+                dat.nodeX, dat.nodeY = 400, -200
+            except Exception:  # noqa: BLE001
+                return None
+        return dat
+
+    def _publish_diagnostics(self, diags):
+        dat = self._errors_dat()
+        if dat is None:
+            return
+        try:
+            dat.clear()
+            dat.appendRow(['severity', 'file', 'line', 'col', 'code', 'message'])
+            for d in diags:
+                dat.appendRow([d['severity'], d['file'], d['line'], d['col'], d['code'], d['message']])
+        except Exception as e:  # noqa: BLE001
+            self._debug('Build', f'could not publish diagnostics: {e}')
+
+    # ========================================================================================== #
+    #  PROPERTIES                                                                                #
+    # ========================================================================================== #
+
+    @staticmethod
+    def _peek_plugin_builder_dir(settings_text):
+        for line in (settings_text or '').splitlines():
+            if line.strip().lower().startswith('pluginbuilderdir'):
+                _, _, v = line.partition('=')
+                v = v.strip().strip('"').replace('${USER_PATH}', os.environ.get('USERPROFILE', ''))
+                return os.path.normpath(v) if v else ''
+        return ''
+
+    @property
+    def working_dir(self):
+        return f"{self.plugin_projects_dir}/{self.Pluginname}"
+
+    @property
+    def abs_working_dir(self):
+        return f"{project.folder}/{self.working_dir}"
+
+    @property
+    def plugin_dir(self):
+        return f"{self.plugins_dir}/{self.Pluginname}"
+
+    @property
+    def Pluginname(self):
+        return self.ownerComp.par.Pluginname.eval()
+
+    @property
+    def CMakeListsPath(self):
+        return f"{self.working_dir}/CMakeLists.txt"
+
+    @property
+    def CMakeListsExists(self):
+        return os.path.exists(self.CMakeListsPath)
+
+    @property
+    def build_config(self):
+        return self.ownerComp.par.Buildconfig.eval()
+
+    @property
+    def PluginBuilderDir(self):
+        return self.settings['paths'].get('PluginBuilderDir', '')
+
+    @property
+    def include_dir(self):
+        custom = self.settings['paths'].get('SdkIncludeDir', '')
+        return custom if custom else f"{self.PluginBuilderDir}/include"
+
+    @property
+    def SourceDir(self):
+        return f"{self.working_dir}/source"
+
+    @property
+    def ninja_dir(self):
+        return self.toolchain.get('ninja_dir', '')
+
+    @property
+    def template_dir(self):
+        return f"{self.PluginBuilderDir}/templates"
+
+    @property
+    def vcvarsall(self):
+        return self.toolchain.get('vcvarsall', '')
+
+    @property
+    def CurrentBinDir(self):
+        return f"PluginProjects/{self.Pluginname}/build/bin/{self.build_config}"
+
+    @property
+    def TDProjectName(self):
+        return self.core.td_project_name(project.name)
+
+    @property
+    def TDPath(self):
+        return f"{app.binFolder}/TouchDesigner.exe"
+
+    @property
+    def TDSamplesDir(self):
+        try:
+            return f"{app.samplesFolder}/CPlusPlus"
+        except Exception:  # noqa: BLE001
+            return ''
+
+    @property
+    def PluginPath(self):
+        return f"{self.plugin_dir}/{self.Pluginname}.dll"
+
+    @property
+    def build_path(self):
+        return f"{self.CurrentBinDir}/{self.Pluginname}.dll"
+
+    @property
+    def CompileOnUpdate(self):
+        return bool(self.ownerComp.par.Compileonupdate.eval())
+
+    @property
+    def cmake_build_cmd(self):
+        """Human-readable configure command (the runner receives the argv list from _configure_args)."""
+        return ' '.join(self._configure_args())
+
+    @property
+    def cmake_build_plugin_cmd(self):
+        return ' '.join(self._build_args())
+
+    @property
+    def cmake_clean_cmd(self):
+        return 'ninja -C build clean'
+
+    # ========================================================================================== #
+    #  PATH / TOOLCHAIN VALIDATION                                                               #
+    # ========================================================================================== #
+
+    def check_paths(self):
+        """Resolve the toolchain (settings.ini > vswhere > PATH > VS-bundled). Never raises."""
+        paths = self.settings['paths']
+        ok = True
+        if not paths.get('PluginBuilderDir') or not os.path.isdir(paths['PluginBuilderDir']):
+            self._log('Init', f"ERROR: settings.ini [Paths] PluginBuilderDir '{paths.get('PluginBuilderDir')}' does not exist. "
+                              "Open SetSettings.toe and set it to the PluginBuilder_V2 folder.")
+            ok = False
+        self.toolchain = self.core.discover_toolchain(paths, extra_search_dirs=[os.path.join(self.user_home, 'ninja')])
+        for e in self.toolchain['errors']:
+            self._log('Init', f'ERROR: {e}')
+            ok = False
+        if self.toolchain['sources']:
+            self._debug('Init', f"toolchain: {self.toolchain['sources']}")
+        self.PathsValid = ok
+        return ok
+
+    def _check_sdk_versions(self):
+        samples = self.TDSamplesDir
+        if not samples or not os.path.isdir(samples) or not self.sdk_versions:
+            return
+        installed = self.core.installed_sdk_versions(samples)
+        msg = self.core.sdk_mismatch_message(self.sdk_versions, installed)
+        if msg:
+            self._log('Init', 'WARNING: ' + msg)
+            self._set_warning(msg)
+
+    def _populate_template_menu(self):
+        try:
+            par = self.ownerComp.par.Plugintemplate
+            names = list(self.templates.keys())
+            if names:
+                current = par.eval()
+                par.menuNames = names
+                par.menuLabels = [f"{n} ({self.templates[n]['family']})" for n in names]
+                if current in names:
+                    par.val = current
+        except Exception as e:  # noqa: BLE001
+            self._debug('Init', f'template menu not updated: {e}')
+
+    # ========================================================================================== #
+    #  PLUGIN CREATION                                                                           #
+    # ========================================================================================== #
+
+    def create_plugin(self):
+        """Scaffold a new plugin project from a template and kick off the first configure + build."""
+        name = self.Pluginname
+        ok, msg = self.core.validate_plugin_name(name)
+        if not ok:
+            self._set_error(msg)
+            raise ValueError(msg)
+        if not self.PathsValid:
+            self._set_error('Toolchain/paths are not configured — check the textport and settings.ini.')
+            raise RuntimeError('Toolchain not configured')
+
+        template_name = self.ownerComp.par.Plugintemplate.eval()
+        meta = self.templates.get(template_name)
+        if meta is None:
+            msg = f"Unknown template '{template_name}' (available: {', '.join(self.templates) or 'none'})"
+            self._set_error(msg)
+            raise ValueError(msg)
+        family = meta['family']
+        if family not in self.loader_op_map:
+            msg = f"This TouchDesigner build has no cplusplus{family} operator; cannot create a {family} plugin."
+            self._set_error(msg)
+            raise RuntimeError(msg)
+
+        self._log('Create', f"Creating new plugin project '{name}' from template '{template_name}' ({family})")
+        os.makedirs(self.plugin_projects_dir, exist_ok=True)
+        if os.path.exists(self.working_dir):
+            raise FileExistsError(f"Directory {self.working_dir} already exists. Rename plugin or delete the directory.")
+        os.makedirs(self.working_dir)
+
+        op_type = self.core.sanitize_op_type(name)
+        op_icon = self.core.make_op_icon(name)
+        if self._op_type_collides(op_type, family):
+            alt = self.core.sanitize_op_type(name + 'custom')
+            self._set_warning(f"opType '{op_type}' collides with a built-in {family}; using '{alt}'.")
+            op_type = alt
+
+        try:
+            # --- CMakeLists.txt (tiny; includes cmake/TDPlugin.cmake) + plugin.json manifest ---
+            extra = []
+            if 'cuda' not in meta.get('features', []):
+                extra.append(f'# td_plugin_optimize({name} AVX2 FAST_MATH)')
+            cmake_text = self.cmake_blocks.assemble(name, family, self.PluginBuilderDir,
+                                                    features=meta.get('features', []), extra_lines=extra)
+            with open(f"{self.working_dir}/CMakeLists.txt", 'w', encoding='utf-8') as f:
+                f.write(cmake_text)
+            manifest = {
+                'name': name, 'family': family, 'optype': op_type, 'template': template_name,
+                'features': meta.get('features', []), 'api_versions': self.sdk_versions,
+                'plugin_builder_dir': self.PluginBuilderDir, 'created': time.strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            self.core.write_plugin_manifest(self.working_dir, manifest)
+            self._log('Create', 'Generated CMakeLists.txt + plugin.json')
+
+            # --- IDE files ---
+            shutil.copyfile(f"{self.PluginBuilderDir}/source/CMakePresets.json", f"{self.working_dir}/CMakePresets.json")
+            self._write_launch_vs_json()
+            self._write_vscode_files()
+
+            # --- template sources ---
+            os.makedirs(f"{self.working_dir}/source")
+            replacements = self.core.template_replacements(
+                name, op_type, name, op_icon,
+                self.settings['plugininfo']['Author'], self.settings['plugininfo']['Email'],
+                self.settings['plugininfo'].get('HelpURL', ''))
+            src_dir = os.path.join(meta['dir'], 'source')
+            files = sorted(os.listdir(src_dir))
+            for file_name in files:
+                with open(os.path.join(src_dir, file_name), 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+                text = self.core.render_source(text, meta.get('replace', template_name), name, replacements)
+                out_name = file_name.replace(meta.get('replace', template_name), name)
+                with open(f"{self.working_dir}/source/{out_name}", 'w', encoding='utf-8') as f:
+                    f.write(text)
+            self._log('Create', f"Copied {len(files)} template source file(s)")
+
+            os.makedirs(self.plugin_dir, exist_ok=True)
+        except Exception as e:  # noqa: BLE001
+            self._log('Create', f"ERROR: {e} — cleaning up project directory")
+            shutil.rmtree(self.working_dir, ignore_errors=True)
+            raise
+
+        self.create_plugin_loader(family)
+        self.build_plugin(then_compile=True)
+        run("args[0].PostCreatePlugin()", self.ownerComp, delayFrames=300)
+        if not self.dev_mode:
+            self.disable_create_pars()
+        self._log('Create', f"Plugin '{name}' created (opType='{op_type}') — configuring + compiling")
+
+    def _op_type_collides(self, op_type, family):
+        try:
+            return globals().get(f"{op_type.lower()}{family}") is not None
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _write_launch_vs_json(self):
+        with open(f"{self.PluginBuilderDir}/source/launch.vs.json", 'r', encoding='utf-8') as f:
+            launch = json.load(f)
+        project_name = self.TDProjectName
+        for cfg in launch['configurations']:
+            cfg['name'] = cfg['name'].replace('__TD_PROJECT_NAME__', project_name)
+            cfg['args'][0] = cfg['args'][0].replace('__TD_PROJECT_NAME__', project_name)
+            cfg['projectTarget'] = cfg['projectTarget'].replace('__PLUGIN_NAME__', self.Pluginname)
+            cfg['exe'] = cfg['exe'].replace('__TD_PATH__', self.TDPath)
+        with open(f"{self.working_dir}/launch.vs.json", 'w', encoding='utf-8') as f:
+            json.dump(launch, f, indent=4)
+
+    def _write_vscode_files(self):
+        toe = f"{project.folder}/{self.TDProjectName}.toe"
+        files = self.core.render_vscode_files(self.Pluginname, self.TDPath, toe, project.folder,
+                                              self.include_dir.replace('\\', '/'))
+        vs_dir = f"{self.working_dir}/.vscode"
+        os.makedirs(vs_dir, exist_ok=True)
+        for fn, data in files.items():
+            with open(os.path.join(vs_dir, fn), 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4)
+
+    def destroy_children(self):
+        preserved = ['builder', 'source', 'CMakeLists']
+        for child in self.ownerComp.findChildren(depth=1):
+            if child.name not in preserved:
+                child.destroy()
+
+    def create_plugin_loader(self, plugin_type):
+        """Create the loader chain (optional in → cplusplus loader → out) for a family."""
+        info = self.loader_op_map.get(plugin_type)
+        if info is None:
+            self._set_error(f'No loader available for family {plugin_type}')
+            return
+        self._log('Create', f"Creating plugin loader chain (type={plugin_type})")
+        self.destroy_children()
+
+        create_input_op = bool(self.ownerComp.par.Createinputop.eval()) and info.get('in') is not None
+        in_op = self.ownerComp.create(info['in'], 'in1') if create_input_op else None
+        self.loader_op = self.ownerComp.create(info['loader'], 'plugin_loader')
+        out_op = self.ownerComp.create(info['out'], 'out1') if info.get('out') is not None else None
+
+        if in_op is not None:
+            in_op.nodeX = -200
+            in_op.outputConnectors[0].connect(self.loader_op.inputConnectors[0])
+        self.loader_op.nodeX = 0
+        if out_op is not None:
+            out_op.nodeX = 200
+            self.loader_op.outputConnectors[0].connect(out_op.inputConnectors[0])
+
+        dll = f"{self.plugin_dir}/{self.Pluginname}.dll"
+        self.loader_op.par.plugin = dll
+        self.loader_op.par.unloadplugin = not os.path.exists(dll)
+        if os.path.exists(dll):
+            try:
+                self._loaded_dll_hash = self.core.file_sha256(dll)
+                self.ownerComp.par.Loadeddll = os.path.basename(dll)
+            except Exception:  # noqa: BLE001
+                pass
+        run("args[0].ext.PluginBuilderExt.sync_custom_parameters()", self.ownerComp, delayFrames=15)
+
+    # ---------------- legacy CMake assembly helpers (kept for external callers) ----------------- #
+
+    def assemble_cmake_text_basic(self):
+        return self.cmake_blocks.assemble(self.Pluginname, 'CHOP', self.PluginBuilderDir)
+
+    def assemble_cmake_text_cuda(self):
+        return self.cmake_blocks.assemble(self.Pluginname, 'TOP', self.PluginBuilderDir, features=['cuda'])
+
+    def assemble_cmake_text_python(self):
+        return self.cmake_blocks.assemble(self.Pluginname, 'CHOP', self.PluginBuilderDir, features=['python'])
+
+    # ========================================================================================== #
+    #  BUILD & COMPILE                                                                           #
+    # ========================================================================================== #
+
+    def _configure_args(self):
+        args = ['cmake', '-B', 'build', '-G', 'Ninja',
+                f'-DPLUGIN_BUILDER_DIR={self.PluginBuilderDir}',
+                f'-DPLUGIN_DIR={project.folder}/{self.plugin_dir}',
+                f'-DCMAKE_BUILD_TYPE={self.build_config}',
+                '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON']
+        samples = self.TDSamplesDir
+        if samples and os.path.isdir(samples):
+            args.append(f'-DTD_SAMPLES_DIR={samples}')
+        return args
+
+    def _build_args(self):
+        args = ['ninja', '-C', 'build']
+        jobs = str(self.settings['options'].get('ParallelJobs', '')).strip()
+        if jobs.isdigit():
+            args += ['-j', jobs]
+        return args
+
+    def _cmake_inputs_hash(self):
+        parts = [self.build_config, self.PluginBuilderDir]
+        for fn in ('CMakeLists.txt', 'plugin.json'):
+            p = f"{self.working_dir}/{fn}"
+            if os.path.exists(p):
+                try:
+                    parts.append(self.core.file_sha256(p))
+                except OSError:
+                    pass
+        return '|'.join(parts)
+
+    def build_plugin(self, then_compile=False, force=False):
+        """CMake configure. Skipped when nothing relevant changed unless force=True."""
+        if not os.path.exists(self.abs_working_dir):
+            self._set_error(f"Directory {self.abs_working_dir} does not exist.")
+            return
+        if not self.CMakeListsExists:
+            self._log('Build', f"SKIPPED — no CMakeLists.txt found at {self.CMakeListsPath}")
+            return
+
+        build_dir = os.path.join(self.abs_working_dir, 'build')
+        cache_file = os.path.join(build_dir, 'CMakeCache.txt')
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                if 'CMAKE_GENERATOR:INTERNAL=' in content and 'CMAKE_GENERATOR:INTERNAL=Ninja' not in content:
+                    self._log('Build', "Detected non-Ninja CMake generator cache. Cleaning build directory...")
+                    shutil.rmtree(build_dir, ignore_errors=True)
+            except Exception as e:  # noqa: BLE001
+                self._log('Build', f"Warning inspecting CMakeCache.txt: {e}")
+
+        inputs_hash = self._cmake_inputs_hash()
+        if not force and os.path.exists(cache_file) and inputs_hash == self._last_configure_hash:
+            self._debug('Build', 'configure skipped (inputs unchanged)')
+            if then_compile:
+                self.compile_plugin()
+            return
+
+        if not self._ensure_runner():
+            return
+        self._log('Build', f"CMake configure '{self.Pluginname}' [{self.build_config}] in {self.abs_working_dir}")
+        self._debug('Build', f"  {self.cmake_build_cmd}")
+        self._set_status('Configuring…')
+
+        def on_done(job, _then=then_compile, _hash=inputs_hash):
+            diags = self.core.parse_diagnostics(job.output)
+            errors, warnings = self.core.summarize_diagnostics(diags)
+            self._publish_diagnostics(diags)
+            if job.ok:
+                self._last_configure_hash = _hash
+                self._set_status(f'Configured ({job.duration_ms:.0f} ms)')
+                self._log('Build', f"configure OK in {job.duration_ms:.0f} ms")
+                if _then:
+                    self.compile_plugin()
+            else:
+                first = next((d for d in diags if d['severity'] == 'error'), None)
+                detail = f": {first['message']}" if first else ''
+                self._set_status(f'CONFIGURE FAILED (exit {job.returncode})')
+                self._set_error(f"CMake configure failed (exit {job.returncode}){detail}")
+                if not self.verbose:
+                    for line in job.output[-25:]:
+                        print(line, end='')
+
+        self.runner.submit(self.core.BuildJob('configure', self._configure_args(), self.abs_working_dir,
+                                              label=f'configure {self.Pluginname}', on_done=on_done))
+        self._schedule_poll()
+
+    def compile_plugin(self):
+        """Ninja build. Coalesces repeated requests while a build is running."""
+        if not self.CMakeListsExists:
+            self._log('Compile', "SKIPPED — no CMakeLists.txt found")
+            return
+        if not self._ensure_runner():
+            return
+        cur = self.runner.current_job
+        if cur is not None and cur.kind == 'build':
+            self._rebuild_after_current = True
+            self._debug('Compile', 'build already running — will rebuild when it finishes')
+            return
+        if self.runner.pending_count > 0 and any(True for _ in [0]):
+            # a configure is queued; the build will follow it. Avoid stacking duplicate builds.
+            pass
+
+        self._log('Compile', f"Ninja build '{self.Pluginname}' → {self.build_path}")
+        self._set_status('Compiling…')
+        self._clear_errors()
+
+        def on_done(job):
+            diags = self.core.parse_diagnostics(job.output)
+            errors, warnings = self.core.summarize_diagnostics(diags)
+            self._publish_diagnostics(diags)
+            if job.cancelled:
+                self._set_status('Build cancelled')
+                return
+            if job.ok:
+                no_work = any('no work to do' in line for line in job.output)
+                self._set_status(f"OK ({job.duration_ms:.0f} ms{', ' + str(warnings) + ' warnings' if warnings else ''})")
+                try:
+                    self.ownerComp.par.Lastbuild = time.strftime('%H:%M:%S') + f" — {job.duration_ms:.0f} ms"
+                except Exception:  # noqa: BLE001
+                    pass
+                self._log('Compile', f"build OK in {job.duration_ms:.0f} ms" + (' (no work to do)' if no_work else ''))
+                if not no_work:
+                    self._schedule_copy()
+            else:
+                first = next((d for d in diags if d['severity'] == 'error'), None)
+                detail = f" — {first['file']}({first['line']}): {first['code']}: {first['message']}" if first else ''
+                self._set_status(f'BUILD FAILED ({errors} error{"s" if errors != 1 else ""})')
+                self._set_error(f"Build failed (exit {job.returncode}){detail}")
+                if not self.verbose:
+                    for d in diags:
+                        print(f"  {d['severity']:<7} {d['file']}({d['line']}): {d['code']} {d['message']}")
+            if self._rebuild_after_current:
+                self._rebuild_after_current = False
+                self.compile_plugin()
+
+        self.runner.submit(self.core.BuildJob('build', self._build_args(), self.abs_working_dir,
+                                              label=f'build {self.Pluginname}', on_done=on_done))
+        self._schedule_poll()
+
+    def BuildAndCompile(self):
+        self.build_plugin(then_compile=True, force=True)
+
+    def cancel_build(self):
+        if self.runner is None:
+            return
+        n = self.runner.cancel_pending()
+        killed = self.runner.kill_current()
+        self._rebuild_after_current = False
+        self._log('Build', f"cancelled {n} pending job(s){', killed running job' if killed else ''}")
+        self._set_status('Cancelled')
+
+    def clean_build(self):
+        build_dir = os.path.join(self.abs_working_dir, 'build')
+        if self.runner is not None:
+            self.cancel_build()
+        if os.path.isdir(build_dir):
+            shutil.rmtree(build_dir, ignore_errors=True)
+            self._log('Build', f"removed {build_dir}")
+        self._last_configure_hash = None
+        self._set_status('Clean')
+
+    def run_tests(self):
+        if not self._ensure_runner():
+            return
+        self._set_status('Testing…')
+
+        def on_done(job):
+            if job.ok:
+                self._set_status(f'Tests passed ({job.duration_ms:.0f} ms)')
+            else:
+                self._set_status(f'TESTS FAILED (exit {job.returncode})')
+                for line in job.output[-30:]:
+                    print(line, end='')
+        self.runner.submit(self.core.BuildJob('test', ['ctest', '--test-dir', 'build', '--output-on-failure'],
+                                              self.abs_working_dir, label='ctest', on_done=on_done))
+        self._schedule_poll()
+
+    def RefreshDats(self):
+        self._debug('Init', "Refreshing file-watching DATs...")
+        for dat in (self.folder_binDat, self.folder_sourceDat, self.CMakeListsDat):
+            if dat is not None:
+                try:
+                    dat.cook(force=True)
+                except Exception:  # noqa: BLE001
+                    pass
+        self.sync_custom_parameters()
+
+    # ========================================================================================== #
+    #  CLEANUP                                                                                   #
+    # ========================================================================================== #
+
+    def clear_plugin_builder(self):
+        self._log('Cleanup', f"Clearing plugin builder (current: '{self.Pluginname}')")
+        self.loader_op = self.ownerComp.op('plugin_loader')
+        if self.loader_op is not None:
+            self.loader_op.par.unloadplugin = True
+            self.loader_op.cook(force=True)
+        self.destroy_children()
+        for page_name in self._mirrored_page_names():
+            page = self._get_custom_page(self.ownerComp, page_name)
+            if page:
+                for p in list(page.pars):
+                    try:
+                        p.destroy()
+                    except Exception:  # noqa: BLE001
+                        pass
+                if page_name != 'Custom':
+                    try:
+                        page.destroy()
+                    except Exception:  # noqa: BLE001
+                        pass
+        self._store_mirrored_pages([])
+        self._last_synced_sig = None
+        if self.Pluginname != '':
+            self.ownerComp.par.Pluginname = ''
+        self._set_status('')
+        self._log('Cleanup', "Plugin builder cleared")
+
+    # ========================================================================================== #
+    #  INSTALL                                                                                   #
+    # ========================================================================================== #
+
+    def install_plugin(self):
+        self._log('Install', f"Installing '{self.Pluginname}' from {self.plugin_dir}")
+        if not os.path.exists(self.plugin_dir):
+            self._set_error(f"Source folder {self.plugin_dir} does not exist.")
+            return
+        install_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Derivative', 'Plugins')
+        os.makedirs(install_dir, exist_ok=True)
+        dest = os.path.join(install_dir, self.Pluginname)
+        os.makedirs(dest, exist_ok=True)
+        self.core.cleanup_old_files(dest)
+        copied = 0
+        for root, _dirs, files in os.walk(self.plugin_dir):
+            for fn in files:
+                if fn.endswith('.old') or '.old' in fn[-6:]:
+                    continue
+                src = os.path.join(root, fn)
+                rel = os.path.relpath(src, self.plugin_dir)
+                dst = os.path.join(dest, rel)
+                try:
+                    changed, note = self.core.safe_replace_file(src, dst)
+                    self._log('Install', f"  {rel}: {note}")
+                    copied += int(changed)
+                except Exception as e:  # noqa: BLE001
+                    self._set_error(f"Could not install {rel}: {e}")
+                    return
+        self._log('Install', f"INSTALLATION COMPLETE: {copied} file(s) updated in {dest}")
+        self._set_status(f'Installed → {dest}')
+
+    # ========================================================================================== #
+    #  UI HELPERS                                                                                #
+    # ========================================================================================== #
+
+    def disable_create_pars(self):
+        self.ownerComp.par.Createplugin.enable = False
+        self.ownerComp.par.Pluginname.readOnly = True
+        self.ownerComp.par.Plugintemplate.readOnly = True
+        self.ownerComp.par.Createinputop.enable = False
+
+    def EnableCreatePars(self):
+        self.ownerComp.par.Createplugin.enable = True
+        self.ownerComp.par.Pluginname.readOnly = False
+        self.ownerComp.par.Plugintemplate.readOnly = False
+        self.ownerComp.par.Createinputop.enable = True
+
+    def PostCreatePlugin(self):
+        if self.CMakeListsDat is not None:
+            self.CMakeListsDat.cook(force=True)
+
+    def file_locked(self, filepath):
+        """True if the file can't be opened for writing (a DLL mapped by a process denies write access)."""
+        try:
+            fd = os.open(filepath, os.O_RDWR)
+            os.close(fd)
+        except FileNotFoundError:
+            return False
+        except (PermissionError, OSError):
+            return True
+        return False
+
+    # ========================================================================================== #
+    #  CUSTOM PARAMETER SYNC (page-preserving, signature-gated)                                  #
+    # ========================================================================================== #
+
+    @staticmethod
+    def _get_custom_page(op, page_name):
+        if op is None or not getattr(op, 'valid', True):
+            return None
+        for page in getattr(op, 'customPages', []):
+            if page.name == page_name:
+                return page
+        return None
+
+    def _mirrored_page_names(self):
+        try:
+            names = self.ownerComp.fetch('PB_mirror_pages', [])
+        except Exception:  # noqa: BLE001
+            names = []
+        names = list(names) if isinstance(names, (list, tuple)) else []
+        if 'Custom' not in names:
+            names.append('Custom')
+        return names
+
+    def _store_mirrored_pages(self, names):
+        try:
+            self.ownerComp.store('PB_mirror_pages', list(names))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _own_page_names(self):
+        """Pages that belong to the builder UI itself (never mirrored into)."""
+        mirrored = set(self._mirrored_page_names())
+        return {p.name for p in self.ownerComp.customPages if p.name not in mirrored}
+
+    @staticmethod
+    def _copy_par_attributes(src_p, dst_p):
+        # menus first so that a menu 'val' is accepted afterwards
+        if hasattr(src_p, 'menuNames') and hasattr(dst_p, 'menuNames'):
+            try:
+                dst_p.menuNames = list(src_p.menuNames)
+                dst_p.menuLabels = list(src_p.menuLabels)
+            except Exception:  # noqa: BLE001
+                pass
+        for attr in ('default', 'min', 'max', 'normMin', 'normMax', 'clampMin', 'clampMax', 'enable', 'readOnly', 'help'):
+            if hasattr(src_p, attr):
+                try:
+                    setattr(dst_p, attr, getattr(src_p, attr))
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _collect_loader_pars(self):
+        """Return list of (tuplet_name, page_name, style, components[list of Par], label, menu_names)."""
+        groups, order = {}, []
+        try:
+            all_pars = self.loader_op.pars()
+        except Exception:  # noqa: BLE001
+            all_pars = []
+        for p in all_pars:
+            name = p.name
+            if not name or name.lower() in BUILT_IN_LOADER_PARS:
+                continue
+            if not (getattr(p, 'isCustom', False) or name[0].isupper()):
+                continue
+            tname = getattr(p, 'tupletName', None) or name
+            page_name = getattr(getattr(p, 'page', None), 'name', 'Custom') or 'Custom'
+            if tname not in groups:
+                groups[tname] = {'page': page_name, 'style': getattr(p, 'style', 'Str'), 'comps': [],
+                                 'label': getattr(p, 'label', tname), 'menu': tuple(getattr(p, 'menuNames', ()) or ())}
+                order.append(tname)
+            groups[tname]['comps'].append(p)
+        out = []
+        for tname in order:
+            g = groups[tname]
+            comps = sorted(g['comps'], key=lambda q: getattr(q, 'vecIndex', 0))
+            out.append((tname, g['page'], g['style'], comps, g['label'], g['menu']))
+        return out
+
+    def _target_page_for(self, page_name, own_pages):
+        if not self.mirror_pages:
+            page_name = 'Custom'
+        elif page_name in own_pages:
+            page_name = f'{page_name} (Plugin)'
+        page = self._get_custom_page(self.ownerComp, page_name)
+        if page is None:
+            page = self.ownerComp.appendCustomPage(page_name)
+        return page
+
+    def _create_mirror_par(self, page, tname, style, size, label):
+        """Create a parameter of the same style on the mirror page. Returns the (first) Par or None."""
+        method = getattr(page, f'append{style}', None)
+        try:
+            if method is None:
+                res = page.appendStr(tname, label=label)
+            elif style in ('Float', 'Int', 'Toggle') and size > 1:
+                res = method(tname, label=label, size=size)
+            else:
+                res = method(tname, label=label)
+        except Exception:  # noqa: BLE001
+            try:
+                res = page.appendStr(tname, label=label)
+            except Exception as e:  # noqa: BLE001
+                self._log('ParamSync', f"  ERROR creating '{tname}' ({style}): {e}")
+                return None
+        return res[0] if isinstance(res, (list, tuple)) else res
+
+    def _bind_components(self, src_comps, dst_first, is_pulse):
+        dst_comps = list(getattr(dst_first, 'tuplet', None) or [dst_first])
+        for src_p, dst_p in zip(src_comps, dst_comps):
+            self._copy_par_attributes(src_p, dst_p)
+            try:
+                if is_pulse:
+                    dst_p.bindExpr = ''
+                else:
+                    # Parameter expressions on a COMP evaluate in the COMP's parent network, so the
+                    # loader (a child of this COMP) must be addressed through `me`.
+                    dst_p.bindExpr = f"me.op('{self.loader_op.name}').par.{src_p.name}"
+                    try:
+                        dst_p.mode = ParMode.BIND
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception:  # noqa: BLE001
+                pass
+
+    def sync_custom_parameters(self, force_rebuild=False, verbose=False):
+        """Mirror the loader's custom parameters (pages preserved) onto ownerComp with BIND expressions."""
+        self.loader_op = self.ownerComp.op('plugin_loader')
+        if self.loader_op is None or not getattr(self.loader_op, 'valid', True):
+            return
+        try:
+            self.loader_op.cook(force=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+        entries = self._collect_loader_pars()
+        sig = self.core.par_signature(
+            [(t, pg, st, len(comps), lb, mn) for (t, pg, st, comps, lb, mn) in entries])
+
+        own_pages = self._own_page_names()
+        if not force_rebuild and sig == self._last_synced_sig:
+            # cheap path: re-assert bindings only (loader may have been re-created)
+            for (tname, page_name, style, comps, label, menu) in entries:
+                existing = getattr(self.ownerComp.par, tname, None) or getattr(self.ownerComp.par, comps[0].name, None)
+                if existing is not None:
+                    self._bind_components(comps, existing, style == 'Pulse')
+            return
+
+        # --- rebuild: compute target pages, remove stale pars, create/update the rest ---
+        expected = {}
+        for (tname, page_name, style, comps, label, menu) in entries:
+            page = self._target_page_for(page_name, own_pages)
+            expected[tname] = page.name
+        mirrored_pages = set(self._mirrored_page_names()) | set(expected.values())
+
+        for page_name in list(mirrored_pages):
+            page = self._get_custom_page(self.ownerComp, page_name)
+            if page is None:
+                continue
+            for p in list(page.pars):
+                tn = getattr(p, 'tupletName', None) or p.name
+                if force_rebuild or expected.get(tn) != page_name:
+                    try:
+                        p.destroy()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        for (tname, page_name, style, comps, label, menu) in entries:
+            page = self._get_custom_page(self.ownerComp, expected[tname])
+            existing = getattr(self.ownerComp.par, tname, None) or getattr(self.ownerComp.par, comps[0].name, None)
+            if existing is not None and getattr(existing, 'style', '') != style:
+                try:
+                    existing.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+                existing = None
+            if existing is None:
+                existing = self._create_mirror_par(page, tname, style, len(comps), label)
+                if existing is None:
+                    continue
+            else:
+                try:
+                    existing.label = label
+                except Exception:  # noqa: BLE001
+                    pass
+            self._bind_components(comps, existing, style == 'Pulse')
+
+        # drop mirrored pages that ended up empty (keep 'Custom' for compatibility)
+        for page_name in list(mirrored_pages):
+            page = self._get_custom_page(self.ownerComp, page_name)
+            if page is not None and page_name != 'Custom' and not list(page.pars):
+                try:
+                    page.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+                mirrored_pages.discard(page_name)
+        self._store_mirrored_pages(sorted(mirrored_pages))
+        self._last_synced_sig = sig
+
+        final = [f"{t}@{expected[t]}" for (t, *_rest) in entries]
+        if verbose or final != self._last_synced_pars:
+            self._log('ParamSync', f"Mirrored {len(entries)} parameter(s) on page(s): {sorted(set(expected.values()))}")
+            for (tname, page_name, style, comps, label, menu) in entries:
+                mode = 'OnParPulse' if style == 'Pulse' else f"BIND → {self.loader_op.name}.par.{comps[0].name}"
+                self._log('ParamSync', f"  {tname:<16} [{style:<6} x{len(comps)}] page='{expected[tname]}' ({mode})")
+            self._last_synced_pars = final
+
+    # ========================================================================================== #
+    #  PARAMETER CALLBACKS                                                                       #
+    # ========================================================================================== #
+
+    def OnParValueChange(self, par, prev):
+        if par.name in self.on_par_value_change_map:
+            self.on_par_value_change_map[par.name](par.eval(), prev)
+        elif self.loader_op is not None and getattr(self.loader_op, 'valid', True):
+            loader_par = getattr(self.loader_op.par, par.name, None)
+            if loader_par is not None:
+                try:
+                    loader_par.val = par.eval()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def OnParPulse(self, par):
+        if par.name in self.on_par_pulse_map:
+            self.on_par_pulse_map[par.name]()
+        elif self.loader_op is not None and getattr(self.loader_op, 'valid', True):
+            loader_par = getattr(self.loader_op.par, par.name, None)
+            if loader_par is not None and getattr(loader_par, 'isPulse', False):
+                try:
+                    loader_par.pulse()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def onOutputto(self, value, prev):
+        self._log('Runner', f"Output mode changed: '{prev}' → '{value}', restarting build runner...")
+        self.close_subprocess()
+        self.start_subprocess()
+
+    def onPluginname(self, value, prev):
+        if value == '':
+            self._log('Init', f"Plugin name cleared (was '{prev}'), clearing builder...")
+            self.clear_plugin_builder()
+            return
+        manifest = self.core.read_plugin_manifest(self.working_dir) if os.path.isdir(self.working_dir) else None
+        if manifest:
+            family = manifest['family']
+            self._log('Init', f"Loading existing PluginProject '{value}' (type={family})")
+            self.create_plugin_loader(family)
+            self._last_configure_hash = None
+            self.start_subprocess()
+            self.sync_custom_parameters(verbose=True)
+            self._set_status('Project loaded')
+            return
+        self.loader_op = self.ownerComp.op('plugin_loader')
+        if self.loader_op is not None:
+            self.loader_op.par.unloadplugin = True
+            self.loader_op.cook(force=True)
+        self.RefreshDats()
+
+    # ========================================================================================== #
+    #  FILE CHANGE CALLBACKS                                                                     #
+    # ========================================================================================== #
+
+    def OnPluginUpdate(self):
+        """folder_bin DAT callback: something changed in build/bin — schedule a hash-gated copy."""
+        if self.loader_op is None or self.Pluginname == '':
+            return
+        if not os.path.exists(self.build_path):
+            self._debug('Build→Copy', f"DLL not yet produced ({self.build_path})")
+            return
+        self._schedule_copy()
+
+    def _schedule_copy(self, delay_frames=10):
+        for r in runs:
+            if r.group == 'copy_dll':
+                r.kill()
+        self.open_attempts = 0
+        try:
+            self._build_mtime = os.path.getmtime(self.build_path)
+        except OSError:
+            self._build_mtime = None
+        self._debug('Build→Copy', f"copy scheduled in {delay_frames} frames (debounce)")
+        run("args[0].ext.PluginBuilderExt._do_copy_plugin()", self.ownerComp, group='copy_dll', delayFrames=delay_frames)
+
+    def _runtime_dlls_in_bin(self):
+        bin_dir = self.CurrentBinDir
+        out = []
+        if os.path.isdir(bin_dir):
+            for fn in os.listdir(bin_dir):
+                if fn.lower().endswith('.dll') and fn != f'{self.Pluginname}.dll':
+                    out.append(os.path.join(bin_dir, fn))
+        return out
+
+    def _do_copy_plugin(self, force=False):
+        """
+        Hot-swap the built DLL into __Plugins__/ with the rename-in-place trick and re-init the loader.
+
+        The plugin is NOT unloaded first: a mapped DLL can be renamed on Windows, so the old image stays
+        loaded until the loader re-inits with the new file. If the build output is still being written
+        (linker lock) the copy is retried a few frames later.
+        """
+        if self.loader_op is None or self.Pluginname == '':
+            return
+        build_path = self.build_path
+        plugin_path = f"{self.plugin_dir}/{self.Pluginname}.dll"
+        if not os.path.exists(build_path):
+            self._log('Build→Copy', f"ERROR: Build output {build_path} does not exist.")
+            return
+
+        # linker still writing? (size/mtime moved since scheduling or file not openable)
+        try:
+            mtime = os.path.getmtime(build_path)
+        except OSError:
+            mtime = None
+        if self.file_locked(build_path) or (self._build_mtime is not None and mtime is not None and mtime > self._build_mtime):
+            self._build_mtime = mtime
+            if self.open_attempts < 40:
+                self.open_attempts += 1
+                self._debug('Build→Copy', f"build output still changing/locked (attempt {self.open_attempts}/40), retrying...")
+                run("args[0].ext.PluginBuilderExt._do_copy_plugin()", self.ownerComp, group='copy_dll', delayFrames=5)
+                return
+            self._set_error(f"{build_path} stayed locked; giving up on this reload (use 'Force Reload Plugin').")
+            self.open_attempts = 0
+            return
+        self.open_attempts = 0
+
+        try:
+            new_hash = self.core.file_sha256(build_path)
+        except OSError as e:
+            self._set_error(f"cannot hash {build_path}: {e}")
+            return
+        if not force and new_hash == self._loaded_dll_hash and os.path.exists(plugin_path):
+            self._debug('Build→Copy', 'DLL unchanged — reload skipped')
+            return
+
+        os.makedirs(self.plugin_dir, exist_ok=True)
+        self.core.cleanup_old_files(self.plugin_dir)
+        try:
+            changed, note = self.core.safe_replace_file(build_path, plugin_path)
+            for dll in self._runtime_dlls_in_bin():
+                dst = os.path.join(self.plugin_dir, os.path.basename(dll))
+                _c, n = self.core.safe_replace_file(dll, dst)
+                self._debug('Build→Copy', f"  runtime {os.path.basename(dll)}: {n}")
+        except PermissionError as e:
+            if self.open_attempts < 20:
+                self.open_attempts += 1
+                self._debug('Build→Copy', f"destination locked ({e}); retrying (attempt {self.open_attempts}/20)")
+                run("args[0].ext.PluginBuilderExt._do_copy_plugin()", self.ownerComp, group='copy_dll', delayFrames=5)
+                return
+            self._set_error(f"Could not replace {plugin_path}: {e}")
+            self.open_attempts = 0
+            return
+        except Exception as e:  # noqa: BLE001
+            self._set_error(f"Copy failed: {e}")
+            return
+
+        self._log('Build→Copy', f"{os.path.basename(plugin_path)}: {note} ({os.path.getsize(plugin_path)} bytes)")
+        self.loader_op.par.plugin = plugin_path
+        self.loader_op.par.unloadplugin = False
+        if hasattr(self.loader_op.par, 'reinitpulse'):
+            self.loader_op.par.reinitpulse.pulse()
+        self.loader_op.cook(force=True)
+        self._loaded_dll_hash = new_hash
+        try:
+            self.ownerComp.par.Loadeddll = f"{os.path.basename(plugin_path)} @ {time.strftime('%H:%M:%S')}"
+        except Exception:  # noqa: BLE001
+            pass
+        self._log('Build→Copy', f"Plugin reloaded from {plugin_path}")
+        run("args[0].ext.PluginBuilderExt.sync_custom_parameters(verbose=True)", self.ownerComp, delayFrames=15)
+
+    def OnSourceUpdate(self):
+        if not self.CompileOnUpdate:
+            self._debug('Source', 'source changed but Compile On Update is off')
+            return
+        self._log('Source', f"Source file changed, recompiling '{self.Pluginname}'...")
+        self.compile_plugin()
+
+    def OnCMakeListsUpdate(self):
+        if not os.path.exists(self.CMakeListsPath):
+            self._log('CMake', f"CMakeLists.txt not found at {self.CMakeListsPath}")
+            return
+        self._log('CMake', "CMakeLists.txt changed, re-running CMake configure...")
+        self.build_plugin(then_compile=self.CompileOnUpdate, force=True)
+
+    # ========================================================================================== #
+    #  BUILD RUNNER MANAGEMENT                                                                   #
+    # ========================================================================================== #
+
+    def _env_factory(self):
+        extra_path = [self.toolchain.get('ninja_dir', ''), self.toolchain.get('cmake_dir', '')]
+        extra_env = {'PLUGINBUILDER_BUILD': '1', 'PLUGIN_BUILDER_DIR': self.PluginBuilderDir}
+        samples = self.TDSamplesDir
+        if samples:
+            extra_env['TD_SAMPLES_DIR'] = samples
+        return self.core.capture_vc_env(self.vcvarsall, self.settings['options'].get('Arch', 'x64') or 'x64',
+                                        extra_path_dirs=extra_path, extra_env=extra_env)
+
+    def _ensure_runner(self):
+        if self.runner is not None and self.runner.alive:
+            return True
+        if not self.PathsValid:
+            self._set_error('Toolchain not configured (vcvarsall / ninja). See textport and settings.ini.')
+            return False
+        capture = self.ownerComp.par.Outputto.eval() != 'TOUCH_TEXT_CONSOLE'
+        self.runner = self.core.BuildRunner(self._env_factory, capture_output=capture, log=lambda m: self._log('Runner', m))
+        self.runner.start()
+        self.process = self.runner        # legacy attribute
+        self._log('Runner', f"Build runner started (vcvarsall={self.vcvarsall}, ninja={self.ninja_dir})")
+        self._schedule_poll()
+        return True
+
+    def start_subprocess(self):
+        """Legacy name: start the build runner (lazy; safe to call repeatedly)."""
+        if not os.path.exists(self.abs_working_dir):
+            self._debug('Runner', f"not started — working dir does not exist: {self.abs_working_dir}")
+            return False
+        return self._ensure_runner()
+
+    def close_subprocess(self):
+        if self.runner is not None:
+            self._log('Runner', "Shutting down build runner...")
+            try:
+                self.runner.shutdown(timeout=2.0)
+            except Exception as e:  # noqa: BLE001
+                self._log('Runner', f"shutdown error: {e}")
+            self.runner = None
+            self.process = None
+
+    def SendCommand(self, command):
+        """Run an arbitrary shell command inside the MSVC environment (legacy API)."""
+        if not self._ensure_runner():
+            raise RuntimeError("Build runner could not be started.")
+        self.runner.submit(self.core.BuildJob('custom', ['cmd.exe', '/c', command], self.abs_working_dir, label=command))
+        self._schedule_poll()
+
+    def _schedule_poll(self):
+        for r in runs:
+            if r.group == 'pb_poll':
+                r.kill()
+        run("args[0].ext.PluginBuilderExt._poll()", self.ownerComp, group='pb_poll', delayFrames=1)
+
+    def _poll(self):
+        """Drain runner events on the main thread; reschedules itself while the runner is alive."""
+        if self.runner is None:
+            return
+        for ev in self.runner.poll():
+            kind = ev[0]
+            if kind == 'line':
+                print(ev[2], end='')
+            elif kind == 'env':
+                ok, msg = ev[1], ev[2]
+                if ok:
+                    self._log('Runner', msg)
+                else:
+                    self._set_error(f"MSVC environment failed: {msg}")
+                    self._set_status('Toolchain error')
+            elif kind == 'start':
+                self._debug('Runner', f"▶ {ev[1].label}")
+        if self.runner is not None and self.runner.alive:
+            delay = 1 if self.runner.busy else 15
+            run("args[0].ext.PluginBuilderExt._poll()", self.ownerComp, group='pb_poll', delayFrames=delay)
+
+    def CheckAndPrintOutput(self):
+        self._poll()
+
+    def GetOutput(self):
+        lines = []
+        if self.runner is not None:
+            for ev in self.runner.poll():
+                if ev[0] == 'line':
+                    lines.append(ev[2])
+        return lines
+
+    def PrintOutput(self):
+        for line in self.GetOutput():
+            print(line, end='')

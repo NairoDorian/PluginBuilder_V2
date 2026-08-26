@@ -1,0 +1,17 @@
+{
+  "name": "CudaPOP",
+  "family": "POP",
+  "replace": "CudaPOP",
+  "main_source": "CudaPOP.cpp",
+  "features": [
+    "cuda"
+  ],
+  "description": "POP processed by a CUDA kernel (requires CUDA Toolkit).",
+  "api_version": 1,
+  "sample_origin": "CudaPOP",
+  "sources": [
+    "CudaPOP.cpp",
+    "CudaPOP.h",
+    "kernel.cu"
+  ]
+}

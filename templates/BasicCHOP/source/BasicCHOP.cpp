@@ -18,6 +18,7 @@
 #include <string.h>
 #include <cmath>
 #include <assert.h>
+#include <vector>
 
 // These functions are basic C function, which the DLL loader can find
 // much easier than finding a C++ Class.
@@ -31,9 +32,10 @@ void
 FillCHOPPluginInfo(CHOP_PluginInfo *info)
 {
 	// Always set this to CHOPCPlusPlusAPIVersion.
-	info->apiVersion = CHOPCPlusPlusAPIVersion;
+	if (!info->setAPIVersion(CHOPCPlusPlusAPIVersion))
+		return;
 
-	// The opType is the unique name for this BasicCHOP. It must start with a 
+	// The opType is the unique name for this CHOP. It must start with a 
 	// capital A-Z character, and all the following characters must lower case
 	// or numbers (a-z, 0-9)
 	info->customOPInfo.opType->setString("#__OP_TYPE__#");
@@ -48,11 +50,14 @@ FillCHOPPluginInfo(CHOP_PluginInfo *info)
 	info->customOPInfo.authorName->setString("#__OP_AUTHOR__#");
 	info->customOPInfo.authorEmail->setString("#__OP_EMAIL__#");
 
-	// This BasicCHOP can work with 0 inputs
+	// This CHOP can work with 0 inputs
 	info->customOPInfo.minInputs = 0;
 
 	// It can accept up to 1 input though, which changes it's behavior
 	info->customOPInfo.maxInputs = 1;
+
+	// Custom website URL that the Operator Help can point to
+	info->customOPInfo.opHelpURL->setString("#__OP_HELPURL__#");
 }
 
 DLLEXPORT
@@ -60,7 +65,7 @@ CHOP_CPlusPlusBase*
 CreateCHOPInstance(const OP_NodeInfo* info)
 {
 	// Return a new instance of your class every time this is called.
-	// It will be called once per BasicCHOP that is using the .dll
+	// It will be called once per CHOP that is using the .dll
 	return new BasicCHOP(info);
 }
 
@@ -69,8 +74,8 @@ void
 DestroyCHOPInstance(CHOP_CPlusPlusBase* instance)
 {
 	// Delete the instance here, this will be called when
-	// Touch is shutting down, when the BasicCHOP using that instance is deleted, or
-	// if the BasicCHOP loads a different DLL
+	// Touch is shutting down, when the CHOP using that instance is deleted, or
+	// if the CHOP loads a different DLL
 	delete (BasicCHOP*)instance;
 }
 
@@ -96,8 +101,8 @@ BasicCHOP::getGeneralInfo(CHOP_GeneralInfo* ginfo, const OP_Inputs* inputs, void
 
 	// Note: To disable timeslicing you'll need to turn this off, as well as ensure that
 	// getOutputInfo() returns true, and likely also set the info->numSamples to how many
-	// samples you want to generate for this BasicCHOP. Otherwise it'll take on length of the
-	// input BasicCHOP, which may be timesliced.
+	// samples you want to generate for this CHOP. Otherwise it'll take on length of the
+	// input CHOP, which may be timesliced.
 	ginfo->timeslice = true;
 
 	ginfo->inputMatchIndex = 0;
@@ -117,7 +122,7 @@ BasicCHOP::getOutputInfo(CHOP_OutputInfo* info, const OP_Inputs* inputs, void* r
 		info->numChannels = 1;
 
 		// Since we are outputting a timeslice, the system will dictate
-		// the numSamples and startIndex of the BasicCHOP data
+		// the numSamples and startIndex of the CHOP data
 		//info->numSamples = 1;
 		//info->startIndex = 0
 
@@ -146,7 +151,7 @@ BasicCHOP::execute(CHOP_Output* output,
 
 	if (inputs->getNumInputs() > 0)
 	{
-		// We know the first BasicCHOP has the same number of channels
+		// We know the first CHOP has the same number of channels
 		// because we returned false from getOutputInfo. 
 
 		inputs->enablePar("Speed", 0);	// not used
@@ -163,7 +168,7 @@ BasicCHOP::execute(CHOP_Output* output,
 				output->channels[i][j] = float(cinput->getChannelData(i)[ind] * scale);
 				ind++;
 
-				// Make sure we don't read past the end of the BasicCHOP input
+				// Make sure we don't read past the end of the CHOP input
 				ind = ind % cinput->numSamples;
 			}
 		}
@@ -230,8 +235,8 @@ BasicCHOP::execute(CHOP_Output* output,
 int32_t
 BasicCHOP::getNumInfoCHOPChans(void * reserved1)
 {
-	// We return the number of channel we want to output to any Info BasicCHOP
-	// connected to the BasicCHOP. In this example we are just going to send one channel.
+	// We return the number of channel we want to output to any Info CHOP
+	// connected to the CHOP. In this example we are just going to send one channel.
 	return 2;
 }
 
@@ -340,6 +345,7 @@ BasicCHOP::setupParameters(OP_ParameterManager* manager, void *reserved1)
 		np.defaultValues[0] = 1.0;
 		np.minSliders[0] = -10.0;
 		np.maxSliders[0] =  10.0;
+		np.help = "Speed of the oscillation.";
 		
 		OP_ParAppendResult res = manager->appendFloat(np);
 		assert(res == OP_ParAppendResult::Success);
@@ -354,6 +360,8 @@ BasicCHOP::setupParameters(OP_ParameterManager* manager, void *reserved1)
 		np.defaultValues[0] = 1.0;
 		np.minSliders[0] = -10.0;
 		np.maxSliders[0] =  10.0;
+		np.help = "Amplitude of the oscillation.";
+
 		
 		OP_ParAppendResult res = manager->appendFloat(np);
 		assert(res == OP_ParAppendResult::Success);
@@ -367,6 +375,7 @@ BasicCHOP::setupParameters(OP_ParameterManager* manager, void *reserved1)
 		sp.label = "Shape";
 
 		sp.defaultValue = "Sine";
+		sp.help = "Shape of the waveform.";
 
 		const char *names[] = { "Sine", "Square", "Ramp" };
 		const char *labels[] = { "Sine", "Square", "Ramp" };
@@ -388,6 +397,7 @@ BasicCHOP::setupParameters(OP_ParameterManager* manager, void *reserved1)
 
 		sp.defaultValue = "regular";
 
+		sp.help = "Modify the waveform shape. Not used currently.";
 		OP_ParAppendResult res = manager->appendDynamicStringMenu(sp);
 		assert(res == OP_ParAppendResult::Success);
 	}
@@ -399,6 +409,7 @@ BasicCHOP::setupParameters(OP_ParameterManager* manager, void *reserved1)
 		np.name = "Reset";
 		np.label = "Reset";
 		
+		np.help = "Reset the channels to 0.";
 		OP_ParAppendResult res = manager->appendPulse(np);
 		assert(res == OP_ParAppendResult::Success);
 	}
@@ -414,3 +425,63 @@ BasicCHOP::pulsePressed(const char* name, void* reserved1)
 	}
 }
 
+void
+BasicCHOP::saveData(OP_NodeSaveState* saver, void* reserved1)
+{
+	std::vector<char> data1, data2;
+
+	data1.resize(100);
+	data2.resize(200);
+
+	bool flip = false;
+	for (auto& entry : data1)
+	{
+		entry = (!flip) ? 0x01 : 0xFF;
+		flip = !flip;
+	}
+
+	saver->saveEntry("entry1", data1.data(), data1.size());
+
+	flip = false;
+
+	for (auto& entry : data2)
+	{
+		entry = (!flip) ? 0x01 : 0xFF;
+		flip = !flip;
+	}
+
+	saver->saveEntry("entry2", data2.data(), data2.size());
+}
+
+void
+BasicCHOP::loadData(const OP_NodeLoadState* loader, void* reserved1)
+{
+	std::vector<char> data;
+	for (int i = 0; i < loader->getKeyCount(); i++)
+	{
+		const char* key = loader->getKey(i);
+		int64_t dataByteSize;
+		const char* value = (const char*)loader->loadEntry(key, &dataByteSize);
+
+		data.resize(dataByteSize);
+		data.assign(value, value + dataByteSize);
+	}
+}
+
+void
+BasicCHOP::inputConnectorLabel(int index, OP_InputLabel* inputLabel, void* reserved1)
+{
+	switch (index)
+	{
+	case 0:
+		{
+			inputLabel->label->setString("This is the label for input 0.");
+			break;
+		}
+	default:
+		{
+			inputLabel->label->setString("Unknown label.");
+			break;
+		}
+	}
+}

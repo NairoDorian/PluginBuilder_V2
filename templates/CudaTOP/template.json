@@ -1,0 +1,17 @@
+{
+  "name": "CudaTOP",
+  "family": "TOP",
+  "replace": "CudaTOP",
+  "main_source": "CudaTOP.cpp",
+  "features": [
+    "cuda"
+  ],
+  "description": "TOP processed by a CUDA kernel (requires CUDA Toolkit).",
+  "api_version": 12,
+  "sample_origin": "CudaTOP",
+  "sources": [
+    "CudaTOP.cpp",
+    "CudaTOP.h",
+    "kernel.cu"
+  ]
+}
