@@ -43,7 +43,10 @@ TouchDesigner ships a different SDK version.
    and starts the first configure + build.
 5. Edit the sources. With **Compile On Update** on, every save triggers a Ninja build; when it succeeds and the DLL
    actually changed (hash-gated), the DLL and any runtime DLLs are swapped in with the rename-in-place trick and
-   the loader re-inits. Custom parameters are mirrored onto the COMP with their original pages and BIND expressions.
+   the loader is reloaded with **fresh parameter definitions** (unload, recreate the `plugin_loader` node if
+   TouchDesigner kept the old parameter objects, load, restore every value / expression / binding) — so changed
+   menu entries, labels and ranges appear without restarting TouchDesigner. Custom parameters are mirrored onto
+   the COMP with their original pages and BIND expressions.
 6. **Status** page: `Build Status`, `Last Build`, `Loaded DLL`, `Cancel Build`, `Clean Build Dir`,
    `Force Reload Plugin`, `Run Tests (ctest)`. Compiler diagnostics are parsed into `builder/build_errors`
    (severity, file, line, code, message) and the first error is shown as a COMP error.

@@ -237,7 +237,7 @@ class PluginBuilderExt:
             if 'Cleanbuild' not in existing:
                 page.appendPulse('Cleanbuild', label='Clean Build Dir')
             if 'Reloadplugin' not in existing:
-                page.appendPulse('Reloadplugin', label='Force Reload Plugin')
+                page.appendPulse('Reloadplugin', label='Force Reload Plugin (fresh parameter definitions)')
             if 'Runtests' not in existing:
                 page.appendPulse('Runtests', label='Run Tests (ctest)')
         except Exception as e:  # noqa: BLE001
@@ -1197,13 +1197,138 @@ class PluginBuilderExt:
                     out.append(os.path.join(bin_dir, fn))
         return out
 
+    # ---------------- loader reload with fresh parameter definitions ----------------------------- #
+    #
+    # TouchDesigner keeps the parameter OBJECTS of a C++ OP across a plugin re-init: setupParameters()
+    # adds parameters that did not exist yet, but an existing parameter keeps its stored definition —
+    # changed menu entries, labels, ranges or defaults only show up on a node that is created fresh
+    # (which is what a TouchDesigner restart does). So a reload first unloads the plugin, checks
+    # whether that removed the custom parameters, and if TouchDesigner kept them recreates the loader
+    # node (same name, same wires). Values / expressions / bindings are snapshotted and restored.
+
+    def _custom_loader_pars(self, loader=None):
+        loader = loader or self.loader_op
+        out = []
+        try:
+            all_pars = loader.pars()
+        except Exception:  # noqa: BLE001
+            return out
+        for p in all_pars:
+            name = p.name
+            if not name or name.lower() in BUILT_IN_LOADER_PARS:
+                continue
+            if getattr(p, 'isCustom', False) or name[0].isupper():
+                out.append(p)
+        return out
+
+    def _snapshot_loader_values(self):
+        """[(name, mode_name, value)] for every custom loader parameter (pulses skipped)."""
+        snap = []
+        for p in self._custom_loader_pars():
+            if getattr(p, 'style', '') == 'Pulse':
+                continue
+            try:
+                mode = getattr(p, 'mode', None)
+                if mode == ParMode.EXPRESSION:
+                    snap.append((p.name, 'expr', p.expr))
+                elif mode == ParMode.BIND:
+                    snap.append((p.name, 'bind', p.bindExpr))
+                else:
+                    snap.append((p.name, 'val', p.val))    # menus: the entry NAME, so index shifts are harmless
+            except Exception:  # noqa: BLE001
+                pass
+        return snap
+
+    def _restore_loader_values(self, snapshot):
+        restored, skipped = 0, []
+        for name, kind, value in snapshot:
+            p = getattr(self.loader_op.par, name, None)
+            if p is None:
+                skipped.append(name)
+                continue
+            try:
+                if kind == 'expr':
+                    p.expr = value
+                    p.mode = ParMode.EXPRESSION
+                elif kind == 'bind':
+                    p.bindExpr = value
+                    p.mode = ParMode.BIND
+                else:
+                    if getattr(p, 'menuNames', None) and value not in p.menuNames:
+                        skipped.append(f"{name}={value!r} (entry no longer exists)")
+                        continue
+                    p.val = value
+                restored += 1
+            except Exception as e:  # noqa: BLE001
+                skipped.append(f"{name} ({e})")
+        return restored, skipped
+
+    def _recreate_loader_node(self):
+        """Replace plugin_loader by a fresh node of the same type, keeping name, position and wires."""
+        old = self.loader_op
+        new = self.ownerComp.create(type(old), 'plugin_loader_fresh')
+        new.nodeX, new.nodeY = old.nodeX, old.nodeY
+        for i, conn in enumerate(old.inputConnectors):
+            for src in list(conn.connections):
+                try:
+                    src.connect(new.inputConnectors[i])
+                except Exception:  # noqa: BLE001
+                    pass
+        for i, conn in enumerate(old.outputConnectors):
+            for dst in list(conn.connections):
+                try:
+                    new.outputConnectors[i].connect(dst)
+                except Exception:  # noqa: BLE001
+                    pass
+        old.destroy()
+        new.name = 'plugin_loader'
+        self.loader_op = new
+        return new
+
+    def _reload_loader_fresh(self, plugin_path):
+        """Unload -> (recreate node if needed) -> load plugin_path, restoring the parameter values."""
+        before = {p.name: tuple(getattr(p, 'menuNames', ()) or ()) for p in self._custom_loader_pars()}
+        snapshot = self._snapshot_loader_values()
+
+        # 1. Unload Plugin ON + cook: TouchDesigner destroys the plugin instance and releases the DLL image
+        try:
+            self.loader_op.par.unloadplugin = True
+            self.loader_op.cook(force=True)
+        except Exception as e:  # noqa: BLE001
+            self._debug('Reload', f'unload failed: {e}')
+        # 2. If the custom parameters survived the unload, only a fresh node gets fresh definitions
+        if self._custom_loader_pars():
+            self._debug('Reload', 'TouchDesigner kept the parameter objects across unload; recreating the loader node')
+            self._recreate_loader_node()
+        # 3. Unload Plugin OFF + cook: the new DLL is mapped and setupParameters() runs on a clean node
+        self.loader_op.par.plugin = plugin_path
+        self.loader_op.par.unloadplugin = False
+        self.loader_op.cook(force=True)
+        # 4. Re-Init pulse + cook: a full instance re-creation on the freshly mapped DLL
+        if hasattr(self.loader_op.par, 'reinitpulse'):
+            self.loader_op.par.reinitpulse.pulse()
+        elif hasattr(self.loader_op.par, 'reinit'):
+            self.loader_op.par.reinit.pulse()
+        self.loader_op.cook(force=True)
+        # 5. Put the user's values / expressions / bindings back
+        restored, skipped = self._restore_loader_values(snapshot)
+        after = {p.name: tuple(getattr(p, 'menuNames', ()) or ()) for p in self._custom_loader_pars()}
+        added = sorted(set(after) - set(before))
+        removed = sorted(set(before) - set(after))
+        menus = sorted(n for n in after if n in before and after[n] != before[n])
+        if added or removed or menus:
+            self._log('Reload', f"parameter definitions changed: added {added or '-'}, removed {removed or '-'}, "
+                                f"menus changed {menus or '-'}")
+        self._debug('Reload', f'{restored} parameter value(s) restored' + (f", skipped {skipped}" if skipped else ''))
+
     def _do_copy_plugin(self, force=False):
         """
-        Hot-swap the built DLL into __Plugins__/ with the rename-in-place trick and re-init the loader.
+        Hot-swap the built DLL into __Plugins__/ with the rename-in-place trick and reload the loader.
 
-        The plugin is NOT unloaded first: a mapped DLL can be renamed on Windows, so the old image stays
-        loaded until the loader re-inits with the new file. If the build output is still being written
-        (linker lock) the copy is retried a few frames later.
+        The DLL file is replaced with the rename trick (a mapped DLL can be renamed on Windows, so the old
+        image stays valid until the loader lets go of it); the loader is then reloaded with fresh parameter
+        definitions by _reload_loader_fresh(). If the build output is still being written (linker lock) the
+        copy is retried a few frames later.
         """
         if self.loader_op is None or self.Pluginname == '':
             return
@@ -1261,11 +1386,7 @@ class PluginBuilderExt:
             return
 
         self._log('Build→Copy', f"{os.path.basename(plugin_path)}: {note} ({os.path.getsize(plugin_path)} bytes)")
-        self.loader_op.par.plugin = plugin_path
-        self.loader_op.par.unloadplugin = False
-        if hasattr(self.loader_op.par, 'reinitpulse'):
-            self.loader_op.par.reinitpulse.pulse()
-        self.loader_op.cook(force=True)
+        self._reload_loader_fresh(plugin_path)
         self._loaded_dll_hash = new_hash
         try:
             self.ownerComp.par.Loadeddll = f"{os.path.basename(plugin_path)} @ {time.strftime('%H:%M:%S')}"

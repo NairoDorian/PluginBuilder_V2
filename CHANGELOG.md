@@ -4,6 +4,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [2.1.1] - 2026-09-10
+
+### Fixed
+- **Hot reload now refreshes parameter definitions.** TouchDesigner keeps the parameter objects of a C++ OP across
+  a plugin re-init: `setupParameters()` adds new parameters, but an existing one keeps its stored definition, so a
+  changed menu entry / label / range only appeared after restarting TouchDesigner (seen with the FFT plugin's new
+  `FFT Planner = Patient` entry). Every reload (automatic after a build, and `Force Reload Plugin`) now unloads the
+  plugin first, recreates the `plugin_loader` node (same name, position and wires) when TouchDesigner kept the
+  parameter objects, loads the new DLL, and restores every custom parameter value / expression / binding (menu
+  values by entry name). The log reports added / removed parameters and changed menus.
+
 ## [2.1.0] - 2026-08-26
 
 ### SDK
