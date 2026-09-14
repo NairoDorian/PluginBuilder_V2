@@ -4,6 +4,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [2.1.4] - 2026-09-14
+
+### Fixed
+- **Header parameters excluded from parameter binding and persistence.** `Header` / `Header2` styles are
+  now treated identically to `Pulse` in `_bind_components` (no `bindExpr`, no `ParMode.BIND`), and in
+  `is_persisted_par` / `snapshot_par` (headers are visual labels with no value to mirror). Previously the
+  sync silently attempted to bind headers, relying on the swallowed `try/except`. (§6.1C)
+
+## [2.1.3] - 2026-09-13
+
+### Fixed
+- **Build-queue guard always-True bug.** `any(True for _ in [0])` — which always passed — replaced with
+  a real early return; stale-plugin_loader_fresh tolerance, DLL-map failure rollback, re-resolve/
+  defensive fallback and per-wire failure logging all hardened. `dedupe_consecutive` added for MSVC
+  repeat-diagnostics during batch builds.
+- 6 new pure tests for par persistence + dedupe → 29/29 green.
+
+## [2.1.2] - 2026-09-12
+
+### Fixed
+- **Hot-reload hardening in `PluginBuilderExt`.** Built-in parameters now persisted across a fresh-node
+  reload; stale-`plugin_loader_fresh` tolerance; DLL-map failure rollback with re-resolve/defensive
+  fallback; per-wire failure logging.
+
+---
+
 ## [2.1.1] - 2026-09-10
 
 ### Fixed

@@ -284,6 +284,9 @@ class LoaderParPersistenceTests(unittest.TestCase):
             self.assertFalse(is_p(ctrl, False, 'Str'), ctrl)
         # pulses never persisted
         self.assertFalse(is_p('refreshpulse', True, 'Pulse'))
+        # headers never persisted (visual labels, no value)
+        self.assertFalse(is_p('section_label', True, 'Header'))
+        self.assertFalse(is_p('section_label', True, 'Header2'))
         # custom pars (uppercase name) are persisted
         self.assertTrue(is_p('Gain', True, 'Float'))
         self.assertTrue(is_p('CustomPar', False, 'Float'))
@@ -299,6 +302,9 @@ class LoaderParPersistenceTests(unittest.TestCase):
         bind = core.snapshot_par('gain', 'Float', core.PAR_BIND, 0, None, '../gain')
         self.assertEqual(bind, ('gain', 'bind', '../gain'))
         self.assertIsNone(core.snapshot_par('go', 'Pulse', core.PAR_CONSTANT, True, None, None))
+        # headers return None (visual labels, no value)
+        self.assertIsNone(core.snapshot_par('header1', 'Header', core.PAR_CONSTANT, True, None, None))
+        self.assertIsNone(core.snapshot_par('header2', 'Header2', core.PAR_CONSTANT, True, None, None))
         # menu value is captured as the entry name, not an index
         menu = core.snapshot_par('srselect', 'Menu', core.PAR_CONSTANT, 'bypass', None, None)
         self.assertEqual(menu, ('srselect', 'val', 'bypass'))

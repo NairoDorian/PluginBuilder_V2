@@ -603,10 +603,10 @@ def is_persisted_par(name, is_custom, style):
     """True if a loader parameter's value should be snapshotted/restored across a reload.
 
     Includes custom parameters and the built-in *value* parameters (timeslice, scope,
-    outputresolution, ...), and excludes Pulse pars plus the reload-control/structural pars.
+    outputresolution, ...), and excludes Pulse and Header pars plus the reload-control/structural pars.
     The `style` argument (e.g. 'Pulse') is enough to decide; ParMode is irrelevant here."""
     lname = (name or '').lower()
-    if not lname or style == 'Pulse':
+    if not lname or style in ('Pulse', 'Header', 'Header2'):
         return False
     if lname in LOADER_PARS_RELOAD_CONTROL:
         return False
@@ -617,8 +617,9 @@ def is_persisted_par(name, is_custom, style):
 def snapshot_par(name, style, mode, val, expr, bind_expr):
     """Reduce a single parameter to a (name, kind, value) snapshot record, or None to skip.
     `mode` must be one of the PAR_* sentinels returned by normalize_par_mode. For menus the captured
-    value is the entry NAME, so later index shifts are harmless."""
-    if style == 'Pulse':
+    value is the entry NAME, so later index shifts are harmless.  Pulse and Header pars are
+    skipped (return None) — they carry no value."""
+    if style in ('Pulse', 'Header', 'Header2'):
         return None
     if mode == PAR_EXPRESSION:
         return (name, 'expr', expr)

@@ -1065,7 +1065,7 @@ class PluginBuilderExt:
             for (tname, page_name, style, comps, label, menu) in entries:
                 existing = getattr(self.ownerComp.par, tname, None) or getattr(self.ownerComp.par, comps[0].name, None)
                 if existing is not None:
-                    self._bind_components(comps, existing, style == 'Pulse')
+                    self._bind_components(comps, existing, style in ('Pulse', 'Header', 'Header2'))
             return
 
         # --- rebuild: compute target pages, remove stale pars, create/update the rest ---
@@ -1100,12 +1100,12 @@ class PluginBuilderExt:
                 existing = self._create_mirror_par(page, tname, style, len(comps), label)
                 if existing is None:
                     continue
-            else:
-                try:
-                    existing.label = label
-                except Exception:  # noqa: BLE001
-                    pass
-            self._bind_components(comps, existing, style == 'Pulse')
+        else:
+            try:
+                existing.label = label
+            except Exception:  # noqa: BLE001
+                pass
+        self._bind_components(comps, existing, style in ('Pulse', 'Header', 'Header2'))
 
         # drop mirrored pages that ended up empty (keep 'Custom' for compatibility)
         for page_name in list(mirrored_pages):
@@ -1123,7 +1123,7 @@ class PluginBuilderExt:
         if verbose or final != self._last_synced_pars:
             self._log('ParamSync', f"Mirrored {len(entries)} parameter(s) on page(s): {sorted(set(expected.values()))}")
             for (tname, page_name, style, comps, label, menu) in entries:
-                mode = 'OnParPulse' if style == 'Pulse' else f"BIND → {self.loader_op.name}.par.{comps[0].name}"
+                mode = 'read-only' if style in ('Pulse', 'Header', 'Header2') else f"BIND → {self.loader_op.name}.par.{comps[0].name}"
                 self._log('ParamSync', f"  {tname:<16} [{style:<6} x{len(comps)}] page='{expected[tname]}' ({mode})")
             self._last_synced_pars = final
 
