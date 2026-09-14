@@ -269,5 +269,75 @@ class VscodeTests(unittest.TestCase):
         self.assertIn('C:/PB/include', files['c_cpp_properties.json']['configurations'][0]['includePath'])
 
 
+class LoaderParPersistenceTests(unittest.TestCase):
+    """Pure logic for which loader parameters survive a fresh-node reload, and snapshot/restore."""
+
+    def test_is_persisted_par_classification(self):
+        is_p = core.is_persisted_par
+        # built-in value pars are persisted
+        self.assertTrue(is_p('timeslice', False, 'Toggle'))
+        self.assertTrue(is_p('outputresolution', False, 'Menu'))
+        self.assertTrue(is_p('pixelformat', False, 'Menu'))
+        # reload-control / structural pars are never persisted
+        for ctrl in ('plugin', 'unloadplugin', 'reinitpulse', 'reinit', 'callbacks', 'language',
+                     'pageindex', 'commonrenamefrom', 'commonrenameto', 'renamefrom', 'renameto'):
+            self.assertFalse(is_p(ctrl, False, 'Str'), ctrl)
+        # pulses never persisted
+        self.assertFalse(is_p('refreshpulse', True, 'Pulse'))
+        # custom pars (uppercase name) are persisted
+        self.assertTrue(is_p('Gain', True, 'Float'))
+        self.assertTrue(is_p('CustomPar', False, 'Float'))
+        # empty / junk names are not
+        self.assertFalse(is_p('', False, 'Str'))
+        self.assertFalse(is_p(None, False, 'Str'))
+
+    def test_snapshot_par_modes(self):
+        const = core.snapshot_par('timeslice', 'Toggle', core.PAR_CONSTANT, True, None, None)
+        self.assertEqual(const, ('timeslice', 'val', True))
+        expr = core.snapshot_par('gain', 'Float', core.PAR_EXPRESSION, 0, 'me.parent().width', None)
+        self.assertEqual(expr, ('gain', 'expr', 'me.parent().width'))
+        bind = core.snapshot_par('gain', 'Float', core.PAR_BIND, 0, None, '../gain')
+        self.assertEqual(bind, ('gain', 'bind', '../gain'))
+        self.assertIsNone(core.snapshot_par('go', 'Pulse', core.PAR_CONSTANT, True, None, None))
+        # menu value is captured as the entry name, not an index
+        menu = core.snapshot_par('srselect', 'Menu', core.PAR_CONSTANT, 'bypass', None, None)
+        self.assertEqual(menu, ('srselect', 'val', 'bypass'))
+
+    def test_restore_action_decisions(self):
+        act = core.restore_action
+        self.assertEqual(act('gain', 'val', 0.5, ()), ('apply_value', 0.5))
+        self.assertEqual(act('gain', 'expr', 'op()', ()), ('apply_expr', 'op()'))
+        self.assertEqual(act('gain', 'bind', '../x', ()), ('apply_bind', '../x'))
+        # menu whose entry still exists -> apply_value
+        self.assertEqual(act('srselect', 'val', 'bypass', ('bypass', 'normalize')), ('apply_value', 'bypass'))
+        # menu whose entry vanished -> skip with reason
+        action, detail = act('srselect', 'val', 'gone', ('bypass',))
+        self.assertEqual((action, detail), ('skip', 'entry no longer exists'))
+
+    def test_normalize_par_mode_without_td(self):
+        # With no par_mode binding, everything collapses to CONSTANT (safe fallback).
+        self.assertEqual(core.normalize_par_mode(object(), None), core.PAR_CONSTANT)
+        self.assertEqual(core.normalize_par_mode(None, None), core.PAR_CONSTANT)
+
+    def test_parameter_definition_diff(self):
+        before = {'A': ('on', 'off'), 'B': ('x',), 'Gone': ('old',)}
+        after = {'A': ('on', 'off'), 'B': ('x', 'y'), 'New': ('n',)}
+        added, removed, changed = core.parameter_definition_diff(before, after)
+        self.assertEqual(added, ['New'])
+        self.assertEqual(removed, ['Gone'])
+        self.assertEqual(changed, ['B'])
+        # unchanged menus produce no changed set
+        a, r, c = core.parameter_definition_diff({'A': ('a',)}, {'A': ('a',)})
+        self.assertEqual((a, r, c), ([], [], []))
+
+
+class DedupeTests(unittest.TestCase):
+    def test_collapses_only_immediate_duplicates(self):
+        src = ['a', 'a', 'b', 'a', 'c', 'c', 'c', '']
+        self.assertEqual(list(core.dedupe_consecutive(src)), ['a', 'b', 'a', 'c', ''])
+        # empty input is fine
+        self.assertEqual(list(core.dedupe_consecutive([])), [])
+
+
 if __name__ == '__main__':
     unittest.main()

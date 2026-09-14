@@ -68,26 +68,18 @@ def _import_support_module(name, plugin_builder_dir):
     return __import__(name)
 
 
-BUILT_IN_LOADER_PARS = {
-    'unloadplugin', 'plugin', 'reinit', 'reinitpulse',
-    'timeslice', 'scope', 'srselect', 'exportmethod',
-    'autoexportroot', 'exporttable', 'commonrenamefrom', 'commonrenameto',
-    'outputresolution', 'resolutionw', 'resolutionh', 'aspect', 'aspectw', 'aspecth',
-    'fill', 'filter', 'coord', 'format', 'pixelformat', 'colorformat',
-    'pageindex', 'renamefrom', 'renameto', 'callbacks', 'language',
-}
-
-# Built-in pars that are reloaded by the loader mechanics itself, or that are structural/opaque,
-# so they must NOT be snapshotted across a fresh-node reload (restoring them would fight the reload).
-LOADER_PARS_RELOAD_CONTROL = frozenset({
-    'plugin', 'unloadplugin', 'reinit', 'reinitpulse',
-    'callbacks', 'language', 'commonrenamefrom', 'commonrenameto', 'pageindex', 'renamefrom', 'renameto',
-})
+# -------------------------------------------------------------------------------------------------
+# Reload persistence logic lives in PluginBuilderCore (pure, unit-testable) — see the
+# "Parameter mirroring helpers (pure)" section: is_persisted_par / snapshot_par /
+# restore_action / parameter_definition_diff. PluginBuilderCore is imported per-instance as
+# self.core (see __init__), so these methods can't reference it at module scope; the helpers below
+# just resolve the td.ParMode binding once.
+# -------------------------------------------------------------------------------------------------
 
 
-def _resolve_par_mode():
-    """ParMode is a TouchDesigner builtin; resolve it once so a snapshot/restore step can't fail
-    with a NameError that silently drops parameters."""
+def _par_mode():
+    """Return td.ParMode (a TouchDesigner builtin) if available, else None — used to normalize a
+    parameter's mode onto the PAR_* sentinels before calling the pure Core helpers."""
     pm = globals().get('ParMode')
     if pm is None:
         try:
@@ -744,9 +736,11 @@ class PluginBuilderExt:
             self._rebuild_after_current = True
             self._debug('Compile', 'build already running — will rebuild when it finishes')
             return
-        if self.runner.pending_count > 0 and any(True for _ in [0]):
-            # a configure is queued; the build will follow it. Avoid stacking duplicate builds.
-            pass
+        if self.runner.pending_count > 0:
+            # A configure (or build) is already queued; the existing queue chains to a build, so
+            # don't stack a duplicate build on top of it.
+            self._debug('Compile', 'build skipped — a configure/build is already queued')
+            return
 
         self._log('Compile', f"Ninja build '{self.Pluginname}' → {self.build_path}")
         self._set_status('Compiling…')
@@ -775,8 +769,9 @@ class PluginBuilderExt:
                 self._set_status(f'BUILD FAILED ({errors} error{"s" if errors != 1 else ""})')
                 self._set_error(f"Build failed (exit {job.returncode}){detail}")
                 if not self.verbose:
-                    for d in diags:
-                        print(f"  {d['severity']:<7} {d['file']}({d['line']}): {d['code']} {d['message']}")
+                    rendered = [f"  {d['severity']:<7} {d['file']}({d['line']}): {d['code']} {d['message']}" for d in diags]
+                    for line in self.core.dedupe_consecutive(rendered):
+                        print(line, end='')
             if self._rebuild_after_current:
                 self._rebuild_after_current = False
                 self.compile_plugin()
@@ -986,7 +981,7 @@ class PluginBuilderExt:
             all_pars = []
         for p in all_pars:
             name = p.name
-            if not name or name.lower() in BUILT_IN_LOADER_PARS:
+            if not name or name.lower() in self.core.BUILTIN_LOADER_PARS:
                 continue
             if not (getattr(p, 'isCustom', False) or name[0].isupper()):
                 continue
@@ -1237,7 +1232,7 @@ class PluginBuilderExt:
             return out
         for p in all_pars:
             name = p.name
-            if not name or name.lower() in BUILT_IN_LOADER_PARS:
+            if not name or name.lower() in self.core.BUILTIN_LOADER_PARS:
                 continue
             if getattr(p, 'isCustom', False) or name[0].isupper():
                 out.append(p)
@@ -1246,8 +1241,7 @@ class PluginBuilderExt:
     def _persisted_loader_pars(self, loader=None):
         """Pars whose value should survive a fresh-node reload: every custom parameter plus the
         built-in value parameters (timeslice, scope, outputresolution, resolutionw/h, pixelformat,
-        ...). Excludes the reload-control/structural pars in LOADER_PARS_RELOAD_CONTROL, which the
-        reload manipulates directly."""
+        ...). Excludes the reload-control/structural pars (handled by is_persisted_par)."""
         loader = loader or self.loader_op
         out = []
         try:
@@ -1255,13 +1249,13 @@ class PluginBuilderExt:
         except Exception:  # noqa: BLE001
             return out
         for p in all_pars:
-            name = p.name
-            if not name:
+            try:
+                name = p.name
+                is_custom = getattr(p, 'isCustom', False)
+                style = getattr(p, 'style', '')
+            except Exception:  # noqa: BLE001
                 continue
-            lname = name.lower()
-            if lname in LOADER_PARS_RELOAD_CONTROL:
-                continue
-            if lname in BUILT_IN_LOADER_PARS or getattr(p, 'isCustom', False) or name[0].isupper():
+            if self.core.is_persisted_par(name, is_custom, style):
                 out.append(p)
         return out
 
@@ -1269,44 +1263,51 @@ class PluginBuilderExt:
         """[(name, mode_name, value)] for every persisted loader parameter (pulses skipped).
         Built-in pars are included so a fresh-node reload no longer resets timeslice / output
         resolution / pixel format / etc."""
+        par_mode = _par_mode()
         snap = []
-        par_mode = _resolve_par_mode()
         for p in self._persisted_loader_pars(loader):
-            if getattr(p, 'style', '') == 'Pulse':
-                continue
             try:
-                mode = getattr(p, 'mode', None)
-                if par_mode is not None and mode == par_mode.EXPRESSION:
-                    snap.append((p.name, 'expr', p.expr))
-                elif par_mode is not None and mode == par_mode.BIND:
-                    snap.append((p.name, 'bind', p.bindExpr))
-                else:
-                    snap.append((p.name, 'val', p.val))    # menus: the entry NAME, so index shifts are harmless
+                name = p.name
+                style = getattr(p, 'style', '')
+                mode = self.core.normalize_par_mode(getattr(p, 'mode', None), par_mode)
+                val = getattr(p, 'val', None)
+                expr = getattr(p, 'expr', None)
+                bind = getattr(p, 'bindExpr', None)
             except Exception as e:  # noqa: BLE001
                 self._debug('Reload', f'skipped snapshot of {p.name}: {e}')
+                continue
+            rec = self.core.snapshot_par(name, style, mode, val, expr, bind)
+            if rec is not None:
+                snap.append(rec)
         return snap
 
     def _restore_loader_values(self, snapshot, target=None):
         """target defaults to the current loader_op (the freshly loaded node)."""
         target = target or self.loader_op
+        par_mode = _par_mode()
         restored, skipped = 0, []
-        par_mode = _resolve_par_mode()
         for name, kind, value in snapshot:
             p = getattr(target.par, name, None)
             if p is None:
                 skipped.append(name)
                 continue
             try:
-                if kind == 'expr':
+                menu_names = tuple(getattr(p, 'menuNames', ()) or ())
+                action, detail = self.core.restore_action(name, kind, value, menu_names)
+            except Exception as e:  # noqa: BLE001
+                skipped.append(f"{name} ({e})")
+                continue
+            if action == 'skip':
+                skipped.append(f"{name}={value!r} ({detail})")
+                continue
+            try:
+                if action == 'apply_expr':
                     p.expr = value
                     if par_mode is not None: p.mode = par_mode.EXPRESSION
-                elif kind == 'bind':
+                elif action == 'apply_bind':
                     p.bindExpr = value
                     if par_mode is not None: p.mode = par_mode.BIND
                 else:
-                    if getattr(p, 'menuNames', None) and value not in p.menuNames:
-                        skipped.append(f"{name}={value!r} (entry no longer exists)")
-                        continue
                     p.val = value
                 restored += 1
             except Exception as e:  # noqa: BLE001
@@ -1416,9 +1417,7 @@ class PluginBuilderExt:
         # 5. Put the user's values / expressions / bindings back
         restored, skipped = self._restore_loader_values(snapshot)
         after = {p.name: tuple(getattr(p, 'menuNames', ()) or ()) for p in self._custom_loader_pars()}
-        added = sorted(set(after) - set(before))
-        removed = sorted(set(before) - set(after))
-        menus = sorted(n for n in after if n in before and after[n] != before[n])
+        added, removed, menus = self.core.parameter_definition_diff(before, after)
         if added or removed or menus:
             self._log('Reload', f"parameter definitions changed: added {added or '-'}, removed {removed or '-'}, "
                                 f"menus changed {menus or '-'}")

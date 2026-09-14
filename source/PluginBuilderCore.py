@@ -16,7 +16,8 @@ Contents
 - build execution          BuildJob, BuildRunner (background worker + main-thread poll), WindowsJobObject
 - files                    file_sha256, safe_replace_file (rename-in-place hot swap)
 - sdk                      read_sdk_versions, installed_sdk_versions
-- parameters               par_signature
+- parameters               par_signature, BUILTIN_LOADER_PARS, is_persisted_par,
+                            snapshot_par, restore_action, parameter_definition_diff
 - IDE                      render_vscode_files
 """
 
@@ -556,6 +557,110 @@ def sdk_mismatch_message(ours, installed):
 def par_signature(entries):
     """entries: iterable of (name, page, style, size, label, menu_names_tuple). Returns a hashable signature."""
     return tuple((str(n), str(p), str(s), int(sz), str(l), tuple(m or ())) for n, p, s, sz, l, m in entries)
+
+
+# -------------------------------------------------------------------------------------------------
+# Reload persistence for loader parameters
+#
+# Mirrors of the sets in PluginBuilderExt, kept here so the decision logic is unit-testable without
+# TouchDesigner. A "persisted par" survives a fresh-node reload; the rest are either reload-control
+# (plugin, unloadplugin, reinitpulse, callbacks, ...) or structural (pageindex, common rename).
+# -------------------------------------------------------------------------------------------------
+
+BUILTIN_LOADER_PARS = frozenset({
+    'unloadplugin', 'plugin', 'reinit', 'reinitpulse',
+    'timeslice', 'scope', 'srselect', 'exportmethod',
+    'autoexportroot', 'exporttable', 'commonrenamefrom', 'commonrenameto',
+    'outputresolution', 'resolutionw', 'resolutionh', 'aspect', 'aspectw', 'aspecth',
+    'fill', 'filter', 'coord', 'format', 'pixelformat', 'colorformat',
+    'pageindex', 'renamefrom', 'renameto', 'callbacks', 'language',
+})
+
+# Pulsable/structural pars whose value must never be snapshotted/restored by the reload machinery.
+LOADER_PARS_RELOAD_CONTROL = frozenset({
+    'plugin', 'unloadplugin', 'reinit', 'reinitpulse',
+    'callbacks', 'language', 'commonrenamefrom', 'commonrenameto', 'pageindex',
+    'renamefrom', 'renameto',
+})
+
+# Mode sentinels exchanged with PluginBuilderExt so the Core never imports td.ParMode.
+PAR_CONSTANT, PAR_EXPRESSION, PAR_BIND = 'CONSTANT', 'EXPRESSION', 'BIND'
+
+
+def normalize_par_mode(mode, par_mode):
+    """Map a td.ParMode member onto its string sentinel; anything unrecognised is CONSTANT."""
+    if par_mode is None:
+        return PAR_CONSTANT
+    table = {
+        getattr(par_mode, 'EXPRESSION', None): PAR_EXPRESSION,
+        getattr(par_mode, 'BIND', None): PAR_BIND,
+        getattr(par_mode, 'CONSTANT', None): PAR_CONSTANT,
+    }
+    return table.get(mode, PAR_CONSTANT)
+
+
+def is_persisted_par(name, is_custom, style):
+    """True if a loader parameter's value should be snapshotted/restored across a reload.
+
+    Includes custom parameters and the built-in *value* parameters (timeslice, scope,
+    outputresolution, ...), and excludes Pulse pars plus the reload-control/structural pars.
+    The `style` argument (e.g. 'Pulse') is enough to decide; ParMode is irrelevant here."""
+    lname = (name or '').lower()
+    if not lname or style == 'Pulse':
+        return False
+    if lname in LOADER_PARS_RELOAD_CONTROL:
+        return False
+    is_custom = bool(is_custom) or (bool(name) and name[0].isupper())
+    return lname in BUILTIN_LOADER_PARS or is_custom
+
+
+def snapshot_par(name, style, mode, val, expr, bind_expr):
+    """Reduce a single parameter to a (name, kind, value) snapshot record, or None to skip.
+    `mode` must be one of the PAR_* sentinels returned by normalize_par_mode. For menus the captured
+    value is the entry NAME, so later index shifts are harmless."""
+    if style == 'Pulse':
+        return None
+    if mode == PAR_EXPRESSION:
+        return (name, 'expr', expr)
+    if mode == PAR_BIND:
+        return (name, 'bind', bind_expr)
+    return (name, 'val', val)
+
+
+def restore_action(name, kind, value, menu_names):
+    """Decide how to apply one snapshot record to a live parameter.
+
+    Returns (action, detail) where action is one of:
+      'apply_value'  – set p.val = value
+      'apply_expr'   – set p.expr = value (+ mode EXPRESSION)
+      'apply_bind'   – set p.bindExpr = value (+ mode BIND)
+      'skip'         – do not touch (detail explains why)"""
+    if kind == 'expr':
+        return ('apply_expr', value)
+    if kind == 'bind':
+        return ('apply_bind', value)
+    if menu_names and value not in menu_names:
+        return ('skip', 'entry no longer exists')
+    return ('apply_value', value)
+
+
+def parameter_definition_diff(before, after):
+    """before/after: dict[str, tuple[str,...]] of page/menu_names keyed by par name.
+    Returns (added, removed, changed_menus) lists (sorted)."""
+    added = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    changed = sorted(n for n in after if n in before and after[n] != before[n])
+    return added, removed, changed
+
+
+def dedupe_consecutive(items):
+    """Yield items with immediately-repeated duplicates collapsed (msvc repeats whole warning blocks
+    verbatim across translation units). Order otherwise preserved."""
+    prev = _SENTINEL = object()
+    for item in items:
+        if item != prev:
+            yield item
+            prev = item
 
 
 # =================================================================================================
