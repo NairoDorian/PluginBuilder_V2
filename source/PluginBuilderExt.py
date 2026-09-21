@@ -608,6 +608,20 @@ class PluginBuilderExt:
             in_op.nodeX = -200
             in_op.outputConnectors[0].connect(self.loader_op.inputConnectors[0])
         self.loader_op.nodeX = 0
+        # Pull the loader every frame by leaving its viewer flag on. This is load-bearing, not cosmetic.
+        # Everything the plugin reports - the middle-click info popup, the Info CHOP, the Info DAT, and
+        # the warning/error state - is produced by callbacks TouchDesigner only runs *inside a cook*
+        # (the order is documented at the top of CHOP_CPlusPlusBase.h). The plugin asks to be cooked
+        # every frame via cookEveryFrame, but that only keeps a node cooking once it has cooked; it
+        # cannot cause the first one. The SDK's kick-start switch for that is
+        # OP_CustomOPInfo::cookOnStart, and the same header is explicit that it "only works for Custom
+        # Operators, not cases where the .dll is loaded into CPlusPlus CHOP" - which is exactly how this
+        # loader hosts the plugin. An OP with an active viewer is cooked every frame, so that is the
+        # kick-start available to this host. Without it a loader whose output nothing else views can sit
+        # un-cooked, and then every one of those callbacks is dead at once: the popup comes up empty,
+        # the Info CHOP/DAT stay blank, and a hard failure has no error badge. That failure has no
+        # symptom other than the blank popup, which is why it is worth being deliberate about here.
+        self.loader_op.viewer = True
         if out_op is not None:
             out_op.nodeX = 200
             self.loader_op.outputConnectors[0].connect(out_op.inputConnectors[0])
@@ -1351,7 +1365,36 @@ class PluginBuilderExt:
         # behind and break the name-based lookup).
         new.name = 'plugin_loader'
         self.loader_op = new
+        # A brand-new node inherits none of the old one's state - only the wires are copied above - so the
+        # viewer flag that gets the loader cooked every frame (see create_plugin_loader) has to be set
+        # again here. Dropping it on recreate is precisely how a reload can leave behind a node that never
+        # cooks again, and with it an info popup that never fills in again.
+        new.viewer = True
         return new
+
+    def _ensure_loader_live(self):
+        """Re-assert the two things the loader's information output depends on.
+
+        Both are cheap, idempotent, and have each been the difference between a node whose info popup is
+        full and one whose popup comes up empty with no other symptom: the plugin has to actually be
+        loaded (unloadplugin off), and the node has to be cooked every frame (viewer on - see
+        create_plugin_loader for why that pull is the only kick-start this host has).
+        """
+        if self.loader_op is None or not getattr(self.loader_op, 'valid', True):
+            return
+        try:
+            self.loader_op.viewer = True
+        except Exception as e:  # noqa: BLE001
+            self._debug('Reload', f'could not set the loader viewer flag: {e}')
+        try:
+            pars = self.loader_op.par
+            have_plugin = hasattr(pars, 'plugin') and bool(str(pars.plugin.eval() or '').strip())
+            if have_plugin and hasattr(pars, 'unloadplugin') and pars.unloadplugin.eval():
+                pars.unloadplugin = False
+                self._debug('Reload', 'loader was left unloaded with a plugin path set; plugin reloaded')
+            self.loader_op.cook(force=True)
+        except Exception as e:  # noqa: BLE001
+            self._debug('Reload', f'could not re-assert the loader plugin: {e}')
 
     def _reload_loader_fresh(self, plugin_path):
         """Unload -> (recreate node if needed) -> load plugin_path, restoring the parameter values.
@@ -1413,6 +1456,7 @@ class PluginBuilderExt:
                 self._restore_loader_values(snapshot)
             except Exception as e3:  # noqa: BLE001
                 self._debug('Reload', f'rollback value restore failed: {e3}')
+            self._ensure_loader_live()
             return
         # 5. Put the user's values / expressions / bindings back
         restored, skipped = self._restore_loader_values(snapshot)
@@ -1422,6 +1466,9 @@ class PluginBuilderExt:
             self._log('Reload', f"parameter definitions changed: added {added or '-'}, removed {removed or '-'}, "
                                 f"menus changed {menus or '-'}")
         self._debug('Reload', f'{restored} parameter value(s) restored' + (f", skipped {skipped}" if skipped else ''))
+        # Last step on every path through a reload, including the rollback above: leave the loader both
+        # loaded and cooking, rather than trusting each caller to have done it.
+        self._ensure_loader_live()
 
     def _do_copy_plugin(self, force=False):
         """
