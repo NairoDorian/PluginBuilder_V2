@@ -1191,6 +1191,22 @@ class PluginBuilderExt:
         if self.loader_op is not None:
             self.loader_op.par.unloadplugin = True
             self.loader_op.cook(force=True)
+            # Unloading is right when there is genuinely nothing to load - but this branch is reached on a
+            # *failed manifest read*, which is not the same thing and is not always permanent. If the
+            # working directory is momentarily unreadable, or the manifest is mid-write, or the timing of
+            # parameter initialization puts this callback before `working_dir` resolves, then a node that
+            # had a perfectly good plugin loaded gets its plugin killed and never gets it back.
+            #
+            # That is the whole of a bug that reads as intermittent: an unloaded CPlusPlus CHOP has no
+            # plugin, so it has no information surface at all - a blank middle-click popup - while its last
+            # cooked output stays on the screen and looks healthy, so the node appears to work. It comes
+            # back the moment anything reloads the loader, which is why a rebuild appears to "fix" it.
+            #
+            # _ensure_loader_live() is the right repair and not a blind one: it re-enables the plugin only
+            # when `plugin` actually holds a path, so a node with nothing configured still ends up unloaded,
+            # and setting the viewer flag is what keeps the node cooking so this cannot recur through the
+            # other door (see create_plugin_loader).
+            self._ensure_loader_live()
         self.RefreshDats()
 
     # ========================================================================================== #
