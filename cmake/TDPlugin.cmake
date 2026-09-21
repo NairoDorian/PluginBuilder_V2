@@ -28,7 +28,7 @@
 #      td_add_plugin(<name> FAMILY <CHOP|TOP|DAT|SOP|POP> [SOURCES_DIR <dir>] [FEATURES <cuda|python|opencv>...])
 #      td_plugin_optimize(<name> [AVX2] [AVX512] [FAST_MATH] [LTO])
 #      td_plugin_add_runtime_dll(<name> <dll-path>...)
-#      td_plugin_use_fftw3(<name> [ROOT <dir>] [PRECISION f|d])
+#      td_plugin_use_fftw3(<name> [ROOT <dir>] [PRECISION f|d] [VERSION <tag>])
 #      td_plugin_use_cuda(<name>)
 #      td_plugin_use_python(<name>)
 #      td_plugin_use_opencv(<name> [COMPONENTS ...])
@@ -287,18 +287,53 @@ endfunction()
 
 # ---------------------------------------------------------------------------------------------
 # td_plugin_use_fftw3 — vendored prebuilt FFTW3 (Windows dll64 layout)
-#   expects <ROOT>/include/fftw3.h, <ROOT>/lib/libfftw3f-3.{def,lib}, <ROOT>/bin|lib/libfftw3f-3.dll
-#   generates the MSVC import library from the .def when missing.
+#
+#   td_plugin_use_fftw3(<name> [ROOT <dir>] [PRECISION f|d] [VERSION <tag>])
+#
+# Versioned layout (preferred):
+#   <ROOT>/include/fftw3-<tag>.h            the upstream header, unmodified
+#   <ROOT>/include/fftw3.h                  forwarder to it, so #include <fftw3.h> keeps working
+#   <ROOT>/lib/libfftw3f-<tag>.def          export list, generated from the built DLL
+#   <ROOT>/lib/libfftw3f-<tag>.lib          MSVC import library (regenerated from the .def if absent)
+#   <ROOT>/bin|lib/libfftw3f-<tag>.dll      the runtime DLL deployed next to the plugin
+#   <ROOT>/VERSION                          provenance: upstream version, source URL, hashes, SIMD set
+#
+# Legacy layout, still supported: libfftw3f-3.{def,lib,dll} + include/fftw3.h.
+#
+# The version tag exists because a vendored FFTW is a binary artifact whose performance is a property
+# of *that file*, not of the code calling it: 3.3.5 with SSE2 only and 3.3.11 with AVX2 codelets are
+# different machines behind an identical API. Putting the tag in every artifact name (DLL, import
+# library, .def, .exp, header) means the running DLL can be identified from the plugin folder alone,
+# with no build log to hand, and it makes two versions safely co-installable.
+#
+# Two consumer details that are easy to get wrong and are handled here:
+#   * FFTW_DLL must be defined for MSVC consumers. fftw3.h is explicit about this ("for Windows
+#     compilers, you should add ... #define FFTW_DLL"); without it, data symbols (fftwf_version,
+#     fftwf_cc, fftwf_codelet_optim) bind to the import library's jump thunk rather than to the data
+#     in the DLL, so reading fftwf_version as a C string yields machine code, not a version string.
+#     Under MinGW/libtool this is done for you, which is why it is often forgotten.
+#   * the import library's embedded module name must equal the runtime DLL's file name. A plain
+#     file rename does not achieve that, so the .def is regenerated with the correct LIBRARY line
+#     and lib.exe is re-run whenever the .def is newer than the .lib.
+#
+# DYNAMIC (option, off by default):
+#   Skip linking the import library; the target resolves fftwf_* through LoadLibrary/GetProcAddress at
+#   run time instead. Required whenever more than one FFT library may be selected at run time, because
+#   FFTW3 and Intel oneMKL's FFTW3 interface export the SAME fftwf_* names - linking one of them makes
+#   the choice at link time and the other one unreachable (or, worse, silently resolves to whichever
+#   the loader found first). The header directory and the runtime DLL copy are still set up, and
+#   TD_PLUGIN_FFTW3_DYNAMIC=1 is defined, so the code can assert it is not calling a linked symbol.
+#   Probes and benchmarks that only ever want one implementation should not pass DYNAMIC.
 # ---------------------------------------------------------------------------------------------
 function(td_plugin_use_fftw3 name)
-    cmake_parse_arguments(TDF "" "ROOT;PRECISION" "" ${ARGN})
+    cmake_parse_arguments(TDF "DYNAMIC" "ROOT;PRECISION;VERSION" "" ${ARGN})
     if(NOT TDF_PRECISION)
         set(TDF_PRECISION f)
     endif()
     if(TDF_PRECISION STREQUAL "f")
-        set(_lib libfftw3f-3)
+        set(_stem libfftw3f)
     elseif(TDF_PRECISION STREQUAL "d")
-        set(_lib libfftw3-3)
+        set(_stem libfftw3)
     else()
         message(FATAL_ERROR "td_plugin_use_fftw3: PRECISION must be f or d")
     endif()
@@ -309,28 +344,168 @@ function(td_plugin_use_fftw3 name)
         message(FATAL_ERROR "td_plugin_use_fftw3(${name}): fftw3 not found (looked in 3rdParty/fftw3 of plugin, PluginBuilder and TD samples)")
     endif()
 
-    find_path(FFTW3_INCLUDE_DIR NAMES fftw3.h PATHS "${TDF_ROOT}/include" "${TDF_ROOT}" NO_DEFAULT_PATH)
-    if(MSVC AND EXISTS "${TDF_ROOT}/lib/${_lib}.def" AND NOT EXISTS "${TDF_ROOT}/lib/${_lib}.lib")
-        find_program(MSVC_LIB_EXE lib.exe)
-        if(MSVC_LIB_EXE)
-            message(STATUS "Generating ${_lib}.lib from ${_lib}.def")
-            execute_process(COMMAND "${MSVC_LIB_EXE}" /nologo /machine:x64 "/def:${TDF_ROOT}/lib/${_lib}.def" "/out:${TDF_ROOT}/lib/${_lib}.lib"
-                            WORKING_DIRECTORY "${TDF_ROOT}/lib" RESULT_VARIABLE _r)
-            if(NOT _r EQUAL 0)
-                message(WARNING "lib.exe failed to generate ${_lib}.lib (exit ${_r})")
+    # ---- resolve the version tag -------------------------------------------------------------
+    if(TDF_VERSION)
+        set(_tag "${TDF_VERSION}")
+    else()
+        file(GLOB _versioned_libs "${TDF_ROOT}/lib/${_stem}-*.lib")
+        list(LENGTH _versioned_libs _nv)
+        if(_nv EQUAL 1)
+            get_filename_component(_one "${_versioned_libs}" NAME_WE)
+            string(REPLACE "${_stem}-" "" _tag "${_one}")
+        elseif(_nv GREATER 1)
+            # Deliberately not "pick the highest": version strings do not sort lexicographically
+            # (3.3.6 > 3.3.11 as text) and silently linking the wrong FFTW is exactly the kind of
+            # mistake the version tag exists to prevent.
+            message(FATAL_ERROR
+                "td_plugin_use_fftw3(${name}): ${_nv} versioned FFTW libraries under ${TDF_ROOT}/lib "
+                "(${_versioned_libs}); pass VERSION <tag> to choose one")
+        else()
+            set(_tag "")   # legacy unversioned layout
+        endif()
+    endif()
+    if(_tag)
+        set(_lib "${_stem}-${_tag}")
+    else()
+        set(_lib "${_stem}-3")
+    endif()
+
+    # ---- header ------------------------------------------------------------------------------
+    if(_tag AND EXISTS "${TDF_ROOT}/include/fftw3-${_tag}.h")
+        set(FFTW3_INCLUDE_HINT "fftw3-${_tag}.h")
+    else()
+        set(FFTW3_INCLUDE_HINT "fftw3.h")
+    endif()
+    # Resolved by direct path rather than find_path/find_library, because those cache their answer:
+    # after a version bump on disk, a cached FFTW3_LIBRARY still names the previous version's import
+    # library and the configure either links the wrong FFTW or fails with "missing and no known rule
+    # to make it". The layout is fixed by this function's contract, so stating the path is both
+    # simpler and immune to that. The find_* calls remain only as a fallback for legacy trees.
+    set(_hdr_path "${TDF_ROOT}/include/${FFTW3_INCLUDE_HINT}")
+    if(EXISTS "${_hdr_path}")
+        set(FFTW3_INCLUDE_DIR "${TDF_ROOT}/include")
+    else()
+        find_path(FFTW3_INCLUDE_DIR NAMES fftw3.h PATHS "${TDF_ROOT}/include" "${TDF_ROOT}" NO_DEFAULT_PATH)
+        unset(FFTW3_INCLUDE_DIR CACHE)
+        find_path(FFTW3_INCLUDE_DIR NAMES fftw3.h PATHS "${TDF_ROOT}/include" "${TDF_ROOT}" NO_DEFAULT_PATH)
+    endif()
+
+    # ---- import library ----------------------------------------------------------------------
+    set(_def "${TDF_ROOT}/lib/${_lib}.def")
+    set(_imp "${TDF_ROOT}/lib/${_lib}.lib")
+
+    # The .def's LIBRARY line is what the linker bakes into the import library, and the loader
+    # follows *that* name, not the .lib's file name. Renaming libfftw3f-3.{dll,lib} to a versioned
+    # name without editing the line inside the .def produces an import library that still demands
+    # libfftw3f-3.dll at load time - the plugin then fails with "module not found" while the
+    # correctly-named DLL sits right next to it. The two names are required to agree, so enforce it
+    # here rather than relying on whoever renames the next version to notice.
+    if(EXISTS "${_def}")
+        file(STRINGS "${_def}" _def_lib_line REGEX "^LIBRARY")
+        if(_def_lib_line AND NOT _def_lib_line STREQUAL "LIBRARY ${_lib}.dll")
+            message(STATUS "td_plugin_use_fftw3(${name}): .def declares '${_def_lib_line}', rewriting to 'LIBRARY ${_lib}.dll'")
+            file(READ "${_def}" _def_text)
+            string(REPLACE "${_def_lib_line}" "LIBRARY ${_lib}.dll" _def_text "${_def_text}")
+            file(WRITE "${_def}" "${_def_text}")
+        endif()
+    endif()
+
+    if(MSVC AND EXISTS "${_def}")
+        set(_need_lib NOT EXISTS "${_imp}")
+        if(NOT _need_lib)
+            # Rebuild when the export list changed underneath the import library.
+            if("${_def}" IS_NEWER_THAN "${_imp}")
+                set(_need_lib TRUE)
+            endif()
+        endif()
+        if(_need_lib)
+            find_program(MSVC_LIB_EXE lib.exe)
+            if(MSVC_LIB_EXE)
+                message(STATUS "td_plugin_use_fftw3(${name}): generating ${_lib}.lib from ${_lib}.def")
+                execute_process(COMMAND "${MSVC_LIB_EXE}" /nologo /machine:x64 "/def:${_def}" "/out:${_imp}"
+                                WORKING_DIRECTORY "${TDF_ROOT}/lib" RESULT_VARIABLE _r)
+                if(NOT _r EQUAL 0)
+                    message(WARNING "td_plugin_use_fftw3(${name}): lib.exe failed to generate ${_lib}.lib (exit ${_r})")
+                endif()
+            else()
+                message(WARNING "td_plugin_use_fftw3(${name}): lib.exe not found, cannot generate ${_lib}.lib from ${_lib}.def")
             endif()
         endif()
     endif()
-    find_library(FFTW3_LIBRARY NAMES ${_lib} PATHS "${TDF_ROOT}/lib" "${TDF_ROOT}" NO_DEFAULT_PATH)
-    find_file(FFTW3_DLL NAMES ${_lib}.dll PATHS "${TDF_ROOT}/bin" "${TDF_ROOT}/lib" "${TDF_ROOT}" NO_DEFAULT_PATH)
 
-    if(NOT FFTW3_INCLUDE_DIR OR NOT FFTW3_LIBRARY)
-        message(FATAL_ERROR "td_plugin_use_fftw3(${name}): fftw3.h or ${_lib}.lib not found under ${TDF_ROOT}")
+    if(EXISTS "${TDF_ROOT}/lib/${_lib}.lib")
+        set(FFTW3_LIBRARY "${TDF_ROOT}/lib/${_lib}.lib")
+    else()
+        unset(FFTW3_LIBRARY CACHE)
+        find_library(FFTW3_LIBRARY NAMES ${_lib} PATHS "${TDF_ROOT}/lib" "${TDF_ROOT}" NO_DEFAULT_PATH)
     endif()
-    message(STATUS "FFTW3: ${FFTW3_LIBRARY}  (dll: ${FFTW3_DLL})")
+
+    set(FFTW3_DLL "")
+    foreach(_d "${TDF_ROOT}/bin/${_lib}.dll" "${TDF_ROOT}/lib/${_lib}.dll" "${TDF_ROOT}/${_lib}.dll")
+        if(EXISTS "${_d}")
+            set(FFTW3_DLL "${_d}")
+            break()
+        endif()
+    endforeach()
+
+    if(NOT FFTW3_INCLUDE_DIR OR (NOT FFTW3_LIBRARY AND NOT TDF_DYNAMIC))
+        if(TDF_DYNAMIC)
+            message(FATAL_ERROR "td_plugin_use_fftw3(${name}): ${FFTW3_INCLUDE_HINT} not found under ${TDF_ROOT}")
+        endif()
+        message(FATAL_ERROR "td_plugin_use_fftw3(${name}): ${FFTW3_INCLUDE_HINT} or ${_lib}.lib not found under ${TDF_ROOT}")
+    endif()
+
+    # ---- provenance, from the VERSION file if the vendor kept one ----------------------------
+    set(_fftw3_tag "${_lib}")
+    if(EXISTS "${TDF_ROOT}/VERSION")
+        file(STRINGS "${TDF_ROOT}/VERSION" _ver_lines REGEX "^FFTW_VENDORED_(UPSTREAM_VERSION|BUILD_TAG|SIMD|THREADS)=")
+        foreach(_l IN LISTS _ver_lines)
+            string(REPLACE "=" " = " _l "${_l}")
+            message(STATUS "  fftw3 ${_l}")
+        endforeach()
+        set(_ver_upstream "")
+        foreach(_l IN LISTS _ver_lines)
+            if(_l MATCHES "^FFTW_VENDORED_UPSTREAM_VERSION=([0-9.]+)")
+                set(_ver_upstream "${CMAKE_MATCH_1}")
+            endif()
+        endforeach()
+        if(_ver_upstream)
+            set(_fftw3_tag "${_ver_upstream}")
+        endif()
+    endif()
+
+    if(NOT FFTW3_DLL)
+        if(TDF_DYNAMIC)
+            message(WARNING "td_plugin_use_fftw3(${name}) DYNAMIC: no ${_lib}.dll under ${TDF_ROOT}/bin or /lib. "
+                            "The plugin resolves its FFT library at run time and will fall back to whatever "
+                            "else it can find, so this build will run but not with the vendored FFTW.")
+        else()
+            message(WARNING "td_plugin_use_fftw3(${name}): no ${_lib}.dll under ${TDF_ROOT}/bin or /lib. "
+                            "The plugin will import it at load time and fail with 'module not found' "
+                            "unless it is already on the DLL search path.")
+        endif()
+    endif()
+    message(STATUS "  dll:      ${FFTW3_DLL}")
+    message(STATUS "  header:   ${FFTW3_INCLUDE_DIR}/${FFTW3_INCLUDE_HINT}")
     target_include_directories(${name} PRIVATE "${FFTW3_INCLUDE_DIR}")
-    target_link_libraries(${name} PRIVATE "${FFTW3_LIBRARY}")
     target_compile_definitions(${name} PRIVATE TD_PLUGIN_HAS_FFTW3=1)
+    if(TDF_DYNAMIC)
+        # No target_link_libraries here on purpose: the plugin picks its FFT library at run time.
+        target_compile_definitions(${name} PRIVATE TD_PLUGIN_FFTW3_DYNAMIC=1)
+        message(STATUS "  link:     (dynamic - fftwf_* resolved at run time via LoadLibrary)")
+    else()
+        target_link_libraries(${name} PRIVATE "${FFTW3_LIBRARY}")
+        message(STATUS "  link:     ${FFTW3_LIBRARY}")
+        if(MSVC)
+            # See the note above: without this, fftwf_version and friends read as garbage on MSVC.
+            target_compile_definitions(${name} PRIVATE FFTW_DLL=1)
+        endif()
+    endif()
+    set_property(TARGET ${name} PROPERTY TD_PLUGIN_FFTW3_VERSION "${_fftw3_tag}")
+    # Recorded even for DYNAMIC targets, which deliberately do not link it: the headless test and bench
+    # executables are single-backend by construction (they exist to measure one implementation), so
+    # _td_add_console() links this import library for them. See the DYNAMIC note above.
+    set_property(TARGET ${name} PROPERTY TD_PLUGIN_FFTW3_LINK "${FFTW3_LIBRARY}")
     if(FFTW3_DLL)
         td_plugin_add_runtime_dll(${name} "${FFTW3_DLL}")
     endif()
@@ -408,6 +583,9 @@ function(_td_add_console name target kind)
     target_include_directories(${target} PRIVATE "${_src}" "${TD_SDK_INCLUDE_DIR}")
     get_target_property(_defs ${name} COMPILE_DEFINITIONS)
     if(_defs)
+        # A DYNAMIC plugin defines TD_PLUGIN_FFTW3_DYNAMIC ("fftwf_* comes from LoadLibrary, not the
+        # linker"). These executables link FFTW3 below, so inheriting that marker would be a lie.
+        list(REMOVE_ITEM _defs TD_PLUGIN_FFTW3_DYNAMIC)
         target_compile_definitions(${target} PRIVATE ${_defs})
     endif()
     get_target_property(_opts ${name} COMPILE_OPTIONS)
@@ -421,6 +599,23 @@ function(_td_add_console name target kind)
     get_target_property(_libs ${name} LINK_LIBRARIES)
     if(_libs)
         target_link_libraries(${target} PRIVATE ${_libs})
+    endif()
+    # FFTW3 (if the plugin uses it) is linked here even when the plugin itself is DYNAMIC. A headless
+    # tool measures or probes exactly one implementation, and the direct-symbol form is what lets the
+    # probes read fftwf_version without a backend table of their own.
+    get_target_property(_fftw3lib ${name} TD_PLUGIN_FFTW3_LINK)
+    if(_fftw3lib AND EXISTS "${_fftw3lib}")
+        target_link_libraries(${target} PRIVATE "${_fftw3lib}")
+        if(MSVC)
+            target_compile_definitions(${target} PRIVATE FFTW_DLL=1)
+        endif()
+    endif()
+    # Link options matter as much as compile options here: /GL without /LTCG degrades to a warning
+    # and silently drops the whole-program optimisation, so a bench built from an LTO plugin would
+    # otherwise measure something the plugin is not.
+    get_target_property(_lopts ${name} LINK_OPTIONS)
+    if(_lopts)
+        target_link_options(${target} PRIVATE ${_lopts})
     endif()
     if(TDT_LINK)
         target_link_libraries(${target} PRIVATE ${TDT_LINK})
