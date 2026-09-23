@@ -103,17 +103,23 @@ pySetSpeedMod(PyObject* self, PyObject* value, void*)
 	// while the Python class is still being held on and used elsewhere.
 	if (inst)
 	{
-		// Try to cast it to a double object
+		// Try to cast it to a double object (accepts float, int or anything
+		// implementing __float__). PyNumber_Float returns a new reference that
+		// must be released on every path (the official sample leaked it when an
+		// error was pending).
 		PyObject* cast = PyNumber_Float(value);
 
-		if (cast && !PyErr_Occurred())
+		if (cast)
 		{
 			double v = PyFloat_AsDouble(cast);
-			inst->setSpeedMod(v);
-			me->context->makeNodeDirty();
-			Py_XDECREF(cast);
-			// success
-			return 0;
+			Py_DECREF(cast);
+			if (!(v == -1.0 && PyErr_Occurred()))
+			{
+				inst->setSpeedMod(v);
+				me->context->makeNodeDirty();
+				// success
+				return 0;
+			}
 		}
 	}
 	else
@@ -172,6 +178,9 @@ const char* PythonCallbacksDATStubs =
 extern "C"
 {
 
+// Called once when the DLL is loaded: API version, operator metadata (filled in
+// when the plugin is generated), input counts and, specific to this example, the
+// Python methods/getsets and the default callbacks DAT text.
 DLLEXPORT
 void
 FillCHOPPluginInfo(CHOP_PluginInfo *info)
@@ -294,6 +303,11 @@ CHOPWithPythonClass::getChannelName(int32_t index, OP_String *name, const OP_Inp
 	name->setString("chan1");
 }
 
+// Cook. With an input connected, input 0 is copied to the output multiplied by
+// Scale (no resampling). Without an input, a waveform is generated at 120
+// samples/sec; its speed is multiplied by speedMod (settable from Python) and
+// then passed through the getSpeedAdjust() callback: one Python call per cook.
+// Parameter enable states are handled in setParameterEnableStates().
 void
 CHOPWithPythonClass::execute(CHOP_Output* output, const OP_Inputs* inputs, void* reserved1)
 {
@@ -306,33 +320,37 @@ CHOPWithPythonClass::execute(CHOP_Output* output, const OP_Inputs* inputs, void*
 	if (inputs->getNumInputs() > 0)
 	{
 		// We know the first CHOP has the same number of channels
-		// because we returned false from getOutputInfo. 
+		// because we returned false from getOutputInfo.
 
-		inputs->enablePar("Speed", 0);	// not used
-		inputs->enablePar("Reset", 0);	// not used
-		inputs->enablePar("Shape", 0);	// not used
-
-		int ind = 0;
 		const OP_CHOPInput	*cinput = inputs->getInputCHOP(0);
 
 		for (int i = 0 ; i < output->numChannels; i++)
 		{
+			// An input with 0 samples (or fewer channels) has nothing to read
+			// (the official sample divided by zero here): output 0 instead.
+			if (!cinput || cinput->numSamples <= 0 || i >= cinput->numChannels)
+			{
+				for (int j = 0; j < output->numSamples; j++)
+					output->channels[i][j] = 0.0f;
+				continue;
+			}
+
+			const float* src = cinput->getChannelData(i);
+
+			// Each channel starts at input sample 0; wrap so we never read
+			// past the end of the input.
+			int ind = 0;
 			for (int j = 0; j < output->numSamples; j++)
 			{
-				output->channels[i][j] = float(cinput->getChannelData(i)[ind] * scale);
-				ind++;
-
-				// Make sure we don't read past the end of the CHOP input
-				ind = ind % cinput->numSamples;
+				output->channels[i][j] = float(src[ind] * scale);
+				if (++ind >= cinput->numSamples)
+					ind = 0;
 			}
 		}
 
 	}
 	else // If not input is connected, lets output a sine wave instead
 	{
-		inputs->enablePar("Speed", 1);
-		inputs->enablePar("Reset", 1);
-
 		double speed = inputs->getParDouble("Speed");
 
 		// Apply Python class modifications
@@ -340,20 +358,28 @@ CHOPWithPythonClass::execute(CHOP_Output* output, const OP_Inputs* inputs, void*
 
 		// We'll only be adding one extra argument
 		PyObject* args = myNodeInfo->context->createArgumentsTuple(1, nullptr);
-		// The first argument is already set to the 'op' variable, so we set the second argument to our speed value
-		PyTuple_SET_ITEM(args, 1, PyFloat_FromDouble(speed));
+		PyObject* result = nullptr;
+		if (args)
+		{
+			// The first argument is already set to the 'op' variable, so we set the second argument to our speed value
+			PyTuple_SET_ITEM(args, 1, PyFloat_FromDouble(speed));
 
-		PyObject *result = myNodeInfo->context->callPythonCallback("getSpeedAdjust", args, nullptr, nullptr);
-		// callPythonCallback doesn't take ownership of the args
-		Py_DECREF(args);
+			result = myNodeInfo->context->callPythonCallback("getSpeedAdjust", args, nullptr, nullptr);
+			// callPythonCallback doesn't take ownership of the args
+			Py_DECREF(args);
+		}
 
 		// We own result now, so we need to Py_DECREF it unless we want to hold onto it
 		if (result)
 		{
-			// If we got a float back, replace our current speed with the returned on
-			if (PyFloat_Check(result))
+			// If we got a number back (float or int), replace our current speed with it
+			if (PyFloat_Check(result) || PyLong_Check(result))
 			{
-				speed = PyFloat_AsDouble(result);
+				double v = PyFloat_AsDouble(result);
+				if (v == -1.0 && PyErr_Occurred())
+					PyErr_Clear();	// e.g. an int too large for a double: keep the current speed
+				else
+					speed = v;
 			}
 			Py_DECREF(result);
 		}
@@ -375,26 +401,28 @@ CHOPWithPythonClass::execute(CHOP_Output* output, const OP_Inputs* inputs, void*
 		for (int i = 0; i < output->numChannels; i++)
 		{
 			double offset = myOffset + phase*i;
-			double v = 0.0f;
-			switch(shape)
-			{
-				case 0:		// sine
-					v = sin(offset);
-					break;
 
-				case 1:		// square
-					v = fabs(fmod(offset, 1.0)) > 0.5;
-					break;
-
-				case 2:		// ramp	
-					v = fabs(fmod(offset, 1.0));
-					break;
-			}
-
-			v *= scale;
+			// Evaluate the shape for every sample (the official sample computed
+			// it once per channel, so each timeslice was a flat step).
 			for (int j = 0; j < output->numSamples; j++)
 			{
-				output->channels[i][j] = float(v);
+				double v = 0.0f;
+				switch(shape)
+				{
+					case 0:		// sine
+						v = sin(offset);
+						break;
+
+					case 1:		// square
+						v = fabs(fmod(offset, 1.0)) > 0.5;
+						break;
+
+					case 2:		// ramp
+						v = fabs(fmod(offset, 1.0));
+						break;
+				}
+
+				output->channels[i][j] = float(v * scale);
 				offset += step;
 			}
 		}
@@ -406,7 +434,7 @@ int32_t
 CHOPWithPythonClass::getNumInfoCHOPChans(void * reserved1)
 {
 	// We return the number of channel we want to output to any Info CHOP
-	// connected to the CHOP. In this example we are just going to send one channel.
+	// connected to the CHOP. In this example we send two channels.
 	return 2;
 }
 
@@ -416,7 +444,7 @@ CHOPWithPythonClass::getInfoCHOPChan(int32_t index,
 										void* reserved1)
 {
 	// This function will be called once for each channel we said we'd want to return
-	// In this example it'll only be called once.
+	// (twice in this example).
 
 	if (index == 0)
 	{
@@ -548,3 +576,15 @@ CHOPWithPythonClass::pulsePressed(const char* name, void* reserved1)
 	}
 }
 
+// May be called at any time, not only during a cook, so it only reads
+// parameters/inputs. Replaces the official sample's enablePar() calls in
+// execute(), which never re-enabled Shape once an input had been connected.
+void
+CHOPWithPythonClass::setParameterEnableStates(const OP_Inputs* inputs, OP_ParEnableState* parEnableState, void* reserved1)
+{
+	// Speed, Reset and Shape only drive the generator (no input connected).
+	const bool generating = inputs->getNumInputs() == 0;
+	parEnableState->setEnableState("Speed", generating);
+	parEnableState->setEnableState("Reset", generating);
+	parEnableState->setEnableState("Shape", generating);
+}

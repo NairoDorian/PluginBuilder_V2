@@ -4,6 +4,12 @@ deploy.py — PluginBuilder release packaging (run from inside dev/dev.toe).
 Resets the PluginBuilder COMP to a clean default state, verifies that the code DATs are
 file-synced to ../source/*.py (so the .tox never ships stale embedded copies), strips
 __pycache__ folders, and exports ../PluginBuilder.tox.
+
+Run inside dev/dev.toe (Text DAT with file sync or pasted execute). Uses TD globals
+(op, project) — not importable headlessly. Steps mirror the numbered comments below:
+(1) verify DAT.par.file points at source/*.py so the .tox never ships a stale embed,
+(2) reset creation/status parameters to defaults, (3) drop __pycache__ under the repo
+root, (4) save ../PluginBuilder.tox. Warnings print but do not abort the export.
 """
 
 import os
@@ -11,9 +17,12 @@ import shutil
 
 print('[Deploy] Packaging PluginBuilder.tox release component...')
 
+# TD globals available inside the .toe: op() resolves a sibling/child COMP by name.
 PluginBuilderComp = op('PluginBuilder')
 
 # 1. Verify that the extension/support DATs are linked to the source files on disk.
+#    Stale embedded DATs are the classic "code changed but .tox still runs old logic"
+#    failure; syncfile=True forces a re-read from the linked path before save.
 expected = {'PluginBuilderExt': 'PluginBuilderExt.py', 'PluginBuilderCore': 'PluginBuilderCore.py', 'CMakeBlocks': 'CMakeBlocks.py'}
 problems = []
 for dat_name, file_name in expected.items():
@@ -32,6 +41,8 @@ for p in problems:
     print('[Deploy] WARNING:', p)
 
 # 2. Reset creation parameters to defaults
+#    EnableCreatePars() re-enables the create UI (create_plugin disables it outside DevMode);
+#    status pars are cleared so the shipped .tox opens clean.
 PluginBuilderComp.EnableCreatePars()
 PluginBuilderComp.par.Pluginname = ''
 PluginBuilderComp.par.Plugintemplate.menuIndex = 0
@@ -48,11 +59,12 @@ if errors_dat is not None:
 PluginBuilderComp.unstore('PB_mirror_pages')
 
 # 3. Strip bytecode caches next to the sources
+#    project.folder is the dev .toe's directory; its parent is the PluginBuilder_V2 repo root.
 root = os.path.abspath(os.path.join(project.folder, '..'))
 for dirpath, dirnames, _files in os.walk(root):
     if '__pycache__' in dirnames:
         shutil.rmtree(os.path.join(dirpath, '__pycache__'), ignore_errors=True)
 
-# 4. Export
+# 4. Export — relative to project.folder, i.e. PluginBuilder_V2/PluginBuilder.tox
 PluginBuilderComp.save('../PluginBuilder.tox')
 print('[Deploy] Successfully exported PluginBuilder.tox' + (' (with warnings)' if problems else ''))

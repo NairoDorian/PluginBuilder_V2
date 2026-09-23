@@ -28,6 +28,8 @@
 extern "C"
 {
 
+	// Called once when the DLL is loaded: API version, operator metadata (filled
+	// in when the plugin is generated) and input counts.
 	DLLEXPORT
 	void
 	FillPOPPluginInfo(POP_PluginInfo *info)
@@ -327,7 +329,7 @@ SimpleShapesPOP::cubeGeometry(POP_Output* output, float scale)
 	POP_BufferInfo indexBufCreateInfo;
 	indexBufCreateInfo.usage = POP_BufferUsage::IndexBuffer;
 	indexBufCreateInfo.size = indexSize;
-	OP_SmartRef<POP_Buffer>	indexBuf = myContext->createBuffer(attBufCreateInfo, nullptr);
+	OP_SmartRef<POP_Buffer>	indexBuf = myContext->createBuffer(indexBufCreateInfo, nullptr);
 	if (!indexBuf)
 		return;
 	memcpy(indexBuf->getData(nullptr), indices.data(), indexSize);
@@ -469,7 +471,7 @@ SimpleShapesPOP::mixedPrimitives(POP_Output* output)
 	POP_BufferInfo indexBufCreateInfo;
 	indexBufCreateInfo.usage = POP_BufferUsage::IndexBuffer;
 	indexBufCreateInfo.size = indexSize;
-	OP_SmartRef<POP_Buffer>	indexBuf = myContext->createBuffer(attBufCreateInfo, nullptr);
+	OP_SmartRef<POP_Buffer>	indexBuf = myContext->createBuffer(indexBufCreateInfo, nullptr);
 	if (!indexBuf)
 		return;
 	memcpy(indexBuf->getData(nullptr), indices.data(), indexSize);
@@ -760,7 +762,7 @@ SimpleShapesPOP::mixedPrimitivesComplex(POP_Output* output)
 	POP_BufferInfo indexBufCreateInfo;
 	indexBufCreateInfo.usage = POP_BufferUsage::IndexBuffer;
 	indexBufCreateInfo.size = indexSize;
-	OP_SmartRef<POP_Buffer>	indexBuf = myContext->createBuffer(attBufCreateInfo, nullptr);
+	OP_SmartRef<POP_Buffer>	indexBuf = myContext->createBuffer(indexBufCreateInfo, nullptr);
 	if (!indexBuf)
 		return;
 	memcpy(indexBuf->getData(nullptr), indices.data(), indexSize);
@@ -897,7 +899,7 @@ SimpleShapesPOP::gridGeometry(POP_Output* output)
 	POP_BufferInfo indexBufCreateInfo;
 	indexBufCreateInfo.usage = POP_BufferUsage::IndexBuffer;
 	indexBufCreateInfo.size = indexSize;
-	OP_SmartRef<POP_Buffer>	indexBuf = myContext->createBuffer(attBufCreateInfo, nullptr);
+	OP_SmartRef<POP_Buffer>	indexBuf = myContext->createBuffer(indexBufCreateInfo, nullptr);
 	if (!indexBuf)
 		return;
 	memcpy(indexBuf->getData(nullptr), indices.data(), indexSize);
@@ -931,6 +933,8 @@ getAllAttributes(POP_AttributeClass c, const OP_POPInput* input)
 	for (uint32_t i = 0; i < input->getNumAttributes(c); i++)
 	{
 		const POP_Attribute* attr = input->getAttribute(c, i, nullptr);
+		if (!attr)
+			continue;
 		POP_GetBufferInfo info;
 		info.location = POP_BufferLocation::CPU;
 		OP_SmartRef<POP_Buffer> buf = attr->getBuffer(info, nullptr);
@@ -947,16 +951,20 @@ copyAllAttributes(POP_AttributeClass c, std::vector<std::pair<std::string, OP_Sm
 	{
 		const std::string& name = p.first;
 		const POP_Attribute* attr = input->getAttribute(c, name.c_str(), nullptr);
-		if (!attr)
+		if (!attr || !p.second)
 		{
 			// This should never happen though, since the attrs array was built up from this input.
 			continue;
 		}
+		// getData() on a CPU-located input buffer waits for its GPU->CPU download.
 		Vector* b = (Vector*)p.second->getData(nullptr);
 		output->setAttribute(&p.second, attr->info, sinfo, nullptr);
 	}
 }
 
+// Cook. With an input connected, every buffer of the input is downloaded to the
+// CPU and passed through (a demonstration of downloads: it stalls on the GPU
+// readback every cook). Without an input, the Shape menu selects the generator.
 void
 SimpleShapesPOP::execute(POP_Output* output, const OP_Inputs* inputs, void* reserved)
 {
@@ -994,7 +1002,11 @@ SimpleShapesPOP::execute(POP_Output* output, const OP_Inputs* inputs, void* rese
 		infoBufs.lineStripsPrimIndices = input->getLineStripsPrimIndices(ginfo, nullptr);
 		infoBufs.gridInfo = input->getGridInfo(ginfo, nullptr);
 #endif
-		OP_SmartRef<POP_Buffer> indexBuf = input->getIndexBuffer(nullptr)->getBuffer(ginfo, nullptr);
+		// The input may have no index buffer: check before dereferencing.
+		const POP_IndexBuffer* inputIndex = input->getIndexBuffer(nullptr);
+		OP_SmartRef<POP_Buffer> indexBuf;
+		if (inputIndex)
+			indexBuf = inputIndex->getBuffer(ginfo, nullptr);
 
 		POP_SetBufferInfo sinfo;
 
@@ -1004,7 +1016,8 @@ SimpleShapesPOP::execute(POP_Output* output, const OP_Inputs* inputs, void* rese
 		copyAllAttributes(POP_AttributeClass::Point, pointAttrs, input, output);
 		copyAllAttributes(POP_AttributeClass::Vertex, vertAttrs, input, output);
 		copyAllAttributes(POP_AttributeClass::Primitive, primAttrs, input, output);
-		output->setIndexBuffer(&indexBuf, input->getIndexBuffer(nullptr)->info, sinfo, nullptr);
+		if (inputIndex && indexBuf)
+			output->setIndexBuffer(&indexBuf, inputIndex->info, sinfo, nullptr);
 		output->setInfoBuffers(&infoBufs, sinfo, nullptr);
 	}
 	else
@@ -1060,7 +1073,7 @@ int32_t
 SimpleShapesPOP::getNumInfoCHOPChans(void* reserved)
 {
 	// We return the number of channel we want to output to any Info CHOP
-	// connected to the CHOP. In this example we are just going to send 4 channels.
+	// connected to the POP. In this example we send one channel.
 	return 1;
 }
 
@@ -1080,7 +1093,8 @@ SimpleShapesPOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void* res
 bool
 SimpleShapesPOP::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved)
 {
-	infoSize->rows = 3;
+	// Only one row (executeCount) is filled in getInfoDATEntries.
+	infoSize->rows = 1;
 	infoSize->cols = 2;
 	// Setting this to false means we'll be assigning values to the table
 	// one row at a time. True means we'll do it one column at a time.
@@ -1140,7 +1154,8 @@ SimpleShapesPOP::setupParameters(OP_ParameterManager* manager, void* reserved)
 		sp.name = "Shape";
 		sp.label = "Shape";
 
-		sp.defaultValue = "Cube";
+		// The default must be a menu name, not a label (the official sample used "Cube").
+		sp.defaultValue = "cube";
 
 		std::array<const char *, 5> names = { "cube", "mixedprims", "mixedprimscomplex", "grid", "empty" };
 		std::array<const char *, 5> labels = { "Cube", "Mixed Primitives", "Mixed Primitives (Complex)", "Grid", "Empty" };

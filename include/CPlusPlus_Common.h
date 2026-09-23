@@ -37,6 +37,8 @@ stays the same, otherwise changes won't be backwards compatible
 #include <cmath>
 #include <float.h>
 
+#include "BitMaskFlags.h"
+
 #ifndef PyObject_HEAD
 	struct _object;
 	typedef _object PyObject;
@@ -55,7 +57,7 @@ class POP_CPlusPlus;
 namespace TD
 {
 
-const int OP_CommonAPIVersion = 2;
+const int OP_CommonAPIVersion = 3;
 
 inline int32_t
 extractFamilyAPIVersion(int32_t version)
@@ -99,6 +101,30 @@ class POP_PluginInfo;
 class POP_CPlusPlusBase;
 
 #pragma pack(push, 8)
+
+enum class OP_ParmIndexFlagBits : uint32_t
+{
+	None = 0,
+	X = 1 << 0,
+	Y = 1 << 1,
+	Z = 1 << 2,
+	W = 1 << 3,
+
+	R = X,
+	G = Y,
+	B = Z,
+	A = W,
+
+	e0 = X,
+	e1 = Y,
+	e2 = Z,
+	e3 = W,
+
+	All = 0xFFFFFFFF,
+};
+
+
+TD_ENABLE_BITMASK_FLAGS(OP_ParmIndex);
 
 enum class OP_PixelFormat : int32_t
 {
@@ -773,12 +799,11 @@ public:
 	// The returned string will be in UTF-8 encoding.
 	virtual const char* getParFilePath(const char* name) const = 0;
 
-	// Will take the working color space into account (if enabled), and return the values in that,
+	// Will take the working color space into account (if enabled), and return the values in that space,
 	// using the Parameter Color Space parameter to interpret the values.
-	// That is, the values written in the parameters are treated as what is set in the 'Parameter Color Space',
-	// parameter, and the values you get here will be in the working color space.
-	// Therefore, they will always be returns as one of the spaces in OP_WorkingColorSpace,
-	// which are always linear transfer.
+	// That is, the values set in the parameters are in the color space chosen in the 'Parameter Color Space',
+	// parameter, will be converted so the values you get here will be in the working color space.
+	// Therefore they will always be in a linear transfer, since all of the OP_WorkingColorSpace are linear.
 	virtual bool		getParRGB(const char* name, double& r, double& g, double& b) const = 0;
 	virtual bool		getParRGBA(const char* name, double& r, double& g, double& b, double& a) const = 0;
 private:
@@ -2328,6 +2353,7 @@ public:
 	virtual bool		getRelativeTransform(const char* from_name, const char* to_name, double matrix[4][4]) const = 0;
 
 	// disable or enable updating of the parameter
+	// using the workflow of `setParameterEnableStates()` callback is encouraged instead of using this function.
 	virtual void		 enablePar(const char* name, bool onoff) const = 0;
 
 	// these are defined by paths.
@@ -2459,6 +2485,16 @@ public:
 	// Return a key based on an index.
 	// Use the key returned from `getKey()` to get the value via `loadEntry()`.
 	virtual const char* getKey(int n) const = 0;
+
+	int32_t	reserved[20] = {};
+};
+
+// Class for managing the enable state of a parameter
+// used in the `setParameterEnableStates()` callback
+class OP_ParEnableState
+{
+public:
+	virtual void setEnableState(const char* parName, bool enableState, OP_ParmIndexFlags parmIndexFlags = OP_ParmIndexFlagBits::All) = 0;
 
 	int32_t	reserved[20] = {};
 };
@@ -2797,6 +2833,7 @@ static_assert(sizeof(OP_InputLabel) == 48, "Incorrect Size");
 
 static_assert(sizeof(OP_NodeSaveState) == 88, "Incorrect Size");
 static_assert(sizeof(OP_NodeLoadState) == 88, "Incorrect Size");
+static_assert(sizeof(OP_ParEnableState) == 88, "Incorrect Size");
 
 static_assert(offsetof(OP_NumericParameter, name) == 0, "Incorrect Alignment");
 static_assert(offsetof(OP_NumericParameter, label) == 8, "Incorrect Alignment");

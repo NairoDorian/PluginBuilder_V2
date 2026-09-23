@@ -29,17 +29,21 @@ if a CHOP is connected to the CPlusPlus CHOPs input or not.
 The example is timesliced, which is the more complex way of working.
 
 If an input is connected the node will output the same number of channels as the
-input and divide the first 'N' samples in the input channel by 2. 'N' being the current
-timeslice size. This is noteworthy because if the input isn't changing then the output
-will look wierd since depending on the timeslice size some number of the first samples
-of the input will get used.
+input and multiply the first 'N' samples of each input channel by the Scale parameter.
+'N' being the current timeslice size. This is noteworthy because if the input isn't
+changing then the output will look wierd since depending on the timeslice size some
+number of the first samples of the input will get used.
 
-If no input is connected then the node will output a smooth sine wave at 120hz.
+If no input is connected then the node generates a sine/square/ramp wave sampled at
+120 samples per second. Its speed is multiplied by the Python 'speedMod' member and then
+adjusted by the getSpeedAdjust() function of the callbacks DAT.
 */
 
 class CHOPWithPythonClass;
 
 // To get more help about these functions, look at CHOP_CPlusPlusBase.h
+// The static py* functions in the .cpp reach this instance through
+// getNodeInstance() and call resetFilter()/getSpeedMod()/setSpeedMod()/getExecuteCount().
 class CHOPWithPythonClass : public CHOP_CPlusPlusBase
 {
 public:
@@ -65,6 +69,8 @@ public:
 
 	virtual void		setupParameters(OP_ParameterManager* manager, void *reserved1) override;
 	virtual void		pulsePressed(const char* name, void* reserved1) override;
+
+	virtual void		setParameterEnableStates(const OP_Inputs* inputs, OP_ParEnableState* parEnableState, void* reserved1) override;
 
 	void				resetFilter();
 

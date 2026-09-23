@@ -27,6 +27,9 @@
 extern "C"
 {
 
+// Called once when the DLL is loaded: API version, operator metadata
+// (type, label, icon, author, help URL) and the allowed number of inputs.
+// The string values are filled in when the plugin is generated.
 DLLEXPORT
 void
 FillCHOPPluginInfo(CHOP_PluginInfo *info)
@@ -138,13 +141,17 @@ BasicCHOP::getChannelName(int32_t index, OP_String *name, const OP_Inputs* input
 	name->setString("chan1");
 }
 
+// Cook. With an input connected, input 0 is copied to the output multiplied by
+// Scale (no resampling: output sample j reads input sample j, wrapping when the
+// input is shorter). Without an input, a waveform is generated at 120 samples/sec.
+// Parameter enable states are handled in setParameterEnableStates(), not here.
 void
 BasicCHOP::execute(CHOP_Output* output,
 							  const OP_Inputs* inputs,
 							  void* reserved)
 {
 	myExecuteCount++;
-	
+
 	double	 scale = inputs->getParDouble("Scale");
 
 	// In this case we'll just take the first input and re-output it scaled.
@@ -152,33 +159,37 @@ BasicCHOP::execute(CHOP_Output* output,
 	if (inputs->getNumInputs() > 0)
 	{
 		// We know the first CHOP has the same number of channels
-		// because we returned false from getOutputInfo. 
+		// because we returned false from getOutputInfo.
 
-		inputs->enablePar("Speed", 0);	// not used
-		inputs->enablePar("Reset", 0);	// not used
-		inputs->enablePar("Shape", 0);	// not used
-
-		int ind = 0;
 		const OP_CHOPInput	*cinput = inputs->getInputCHOP(0);
 
 		for (int i = 0 ; i < output->numChannels; i++)
 		{
+			// An input with 0 samples (or fewer channels) has nothing to read
+			// (the official sample divided by zero here): output 0 instead.
+			if (!cinput || cinput->numSamples <= 0 || i >= cinput->numChannels)
+			{
+				for (int j = 0; j < output->numSamples; j++)
+					output->channels[i][j] = 0.0f;
+				continue;
+			}
+
+			const float* src = cinput->getChannelData(i);
+
+			// Each channel starts at input sample 0; wrap so we never read
+			// past the end of the input.
+			int ind = 0;
 			for (int j = 0; j < output->numSamples; j++)
 			{
-				output->channels[i][j] = float(cinput->getChannelData(i)[ind] * scale);
-				ind++;
-
-				// Make sure we don't read past the end of the CHOP input
-				ind = ind % cinput->numSamples;
+				output->channels[i][j] = float(src[ind] * scale);
+				if (++ind >= cinput->numSamples)
+					ind = 0;
 			}
 		}
 
 	}
 	else // If not input is connected, lets output a sine wave instead
 	{
-		inputs->enablePar("Speed", 1);
-		inputs->enablePar("Reset", 1);
-
 		double speed = inputs->getParDouble("Speed");
 		double step = speed * 0.01f;
 
@@ -200,30 +211,28 @@ BasicCHOP::execute(CHOP_Output* output,
 		{
 			double offset = myOffset + phase*i;
 
-
-			double v = 0.0f;
-
-			switch(shape)
-			{
-				case 0:		// sine
-					v = sin(offset);
-					break;
-
-				case 1:		// square
-					v = fabs(fmod(offset, 1.0)) > 0.5;
-					break;
-
-				case 2:		// ramp	
-					v = fabs(fmod(offset, 1.0));
-					break;
-			}
-
-
-			v *= scale;
-
+			// Evaluate the shape for every sample (the official sample computed
+			// it once per channel, so each timeslice was a flat step).
 			for (int j = 0; j < output->numSamples; j++)
 			{
-				output->channels[i][j] = float(v);
+				double v = 0.0f;
+
+				switch(shape)
+				{
+					case 0:		// sine
+						v = sin(offset);
+						break;
+
+					case 1:		// square
+						v = fabs(fmod(offset, 1.0)) > 0.5;
+						break;
+
+					case 2:		// ramp	
+						v = fabs(fmod(offset, 1.0));
+						break;
+				}
+
+				output->channels[i][j] = float(v * scale);
 				offset += step;
 			}
 		}
@@ -236,7 +245,7 @@ int32_t
 BasicCHOP::getNumInfoCHOPChans(void * reserved1)
 {
 	// We return the number of channel we want to output to any Info CHOP
-	// connected to the CHOP. In this example we are just going to send one channel.
+	// connected to the CHOP. In this example we send two channels.
 	return 2;
 }
 
@@ -246,7 +255,7 @@ BasicCHOP::getInfoCHOPChan(int32_t index,
 										void* reserved1)
 {
 	// This function will be called once for each channel we said we'd want to return
-	// In this example it'll only be called once.
+	// (twice in this example).
 
 	if (index == 0)
 	{
@@ -414,6 +423,21 @@ BasicCHOP::setupParameters(OP_ParameterManager* manager, void *reserved1)
 		assert(res == OP_ParAppendResult::Success);
 	}
 
+	// The following multi size momentary parameter demonstrates the use of selective disabling
+	// of multi sized parameters (see setParameterEnableStates)
+	// This parameter is not used in the CHOP functionality
+	// Momentary
+	{
+		OP_NumericParameter	np;
+
+		np.name = "Examplemomentary";
+		np.label = "Example Momentary";
+		np.size = 4;
+
+		OP_ParAppendResult res = manager->appendMomentary(np);
+		assert(res == OP_ParAppendResult::Success);
+	}
+
 }
 
 void 
@@ -460,10 +484,11 @@ BasicCHOP::loadData(const OP_NodeLoadState* loader, void* reserved1)
 	for (int i = 0; i < loader->getKeyCount(); i++)
 	{
 		const char* key = loader->getKey(i);
-		int64_t dataByteSize;
+		int64_t dataByteSize = 0;
 		const char* value = (const char*)loader->loadEntry(key, &dataByteSize);
+		if (!value || dataByteSize <= 0)
+			continue;
 
-		data.resize(dataByteSize);
 		data.assign(value, value + dataByteSize);
 	}
 }
@@ -483,5 +508,32 @@ BasicCHOP::inputConnectorLabel(int index, OP_InputLabel* inputLabel, void* reser
 			inputLabel->label->setString("Unknown label.");
 			break;
 		}
+	}
+}
+
+// May be called at any time, not only during a cook, so it only reads
+// parameters/inputs and never touches cook state.
+void
+BasicCHOP::setParameterEnableStates(const OP_Inputs* inputs, OP_ParEnableState* parEnableState, void* reserved1)
+{
+	// Speed, Reset and Shape only drive the generator, which is used when no
+	// input is connected. Setting the state both ways here also re-enables
+	// Shape after the input is disconnected.
+	const bool generating = inputs->getNumInputs() == 0;
+	parEnableState->setEnableState("Speed", generating);
+	parEnableState->setEnableState("Reset", generating);
+	parEnableState->setEnableState("Shape", generating);
+
+	double speed = inputs->getParDouble("Speed");
+
+	if (speed > 1)
+	{
+		parEnableState->setEnableState("Examplemomentary", false, OP_ParmIndexFlagBits::e0 | OP_ParmIndexFlagBits::e3);
+		parEnableState->setEnableState("Examplemomentary", true, OP_ParmIndexFlagBits::e1 | OP_ParmIndexFlagBits::e2);
+	}
+	else
+	{
+		parEnableState->setEnableState("Examplemomentary", true, OP_ParmIndexFlagBits::e0 | OP_ParmIndexFlagBits::e3);
+		parEnableState->setEnableState("Examplemomentary", false, OP_ParmIndexFlagBits::e1 | OP_ParmIndexFlagBits::e2);
 	}
 }

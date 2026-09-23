@@ -17,6 +17,9 @@
 
 using namespace TD;
 
+// Maximum number of completed frames waiting for the main thread.
+static const size_t MaxQueueSize = 2;
+
 FrameQueue::FrameQueue(TOP_Context* context) :
 	myContext(context)
 {
@@ -31,35 +34,38 @@ FrameQueue::~FrameQueue()
 	}
 }
 
-const int MaxQueueSize = 2;
-
+// Producer side. Reuses the oldest queued (never consumed) buffer when the
+// queue is full, otherwise allocates a new one.
 OP_SmartRef<TOP_Buffer>
 FrameQueue::getBufferToUpdate(uint64_t byteSize, TOP_BufferFlags flags)
 {
-	myLock.lock();
-	
 	OP_SmartRef<TOP_Buffer> buf;
 
-	// If we've already reached the max queue size, replace the oldest buffer
-	// instead of requesting a new one and growing the queue even more.
-	if (myUpdatedBuffers.size() >= MaxQueueSize)
 	{
-		buf = myUpdatedBuffers.front().buf;
-		myUpdatedBuffers.pop_front();
+		std::lock_guard<std::mutex> lock(myLock);
 
-		// If the size of this buffer is way off or if the flags are wrong,
-		// don't use it.
-		if (buf->size < byteSize || buf->size > byteSize * 2 || buf->flags != flags)
+		// If we've already reached the max queue size, replace the oldest buffer
+		// instead of requesting a new one and growing the queue even more.
+		if (myUpdatedBuffers.size() >= MaxQueueSize)
 		{
-			buf.release();
+			buf = std::move(myUpdatedBuffers.front().buf);
+			myUpdatedBuffers.pop_front();
 		}
 	}
 
-	// If we don't have a buffer yet, allocate one
+	// If the size of this buffer is way off or if the flags are wrong,
+	// don't use it.
+	if (buf && (buf->size < byteSize || buf->size > byteSize * 2 || buf->flags != flags))
+	{
+		buf.release();
+	}
+
+	// If we don't have a buffer yet, allocate one. createOutputBuffer() is
+	// thread-safe, so it is called without holding the queue lock (the official
+	// sample held it here, blocking the main thread during the allocation).
 	if (!buf)
 		buf = myContext->createOutputBuffer(byteSize, flags, nullptr);
 
-	myLock.unlock();
 	return buf;
 }
 
@@ -67,9 +73,8 @@ void
 FrameQueue::updateComplete(const BufferInfo& bufInfo)
 {
 	assert(bufInfo.buf);
-	myLock.lock();
+	std::lock_guard<std::mutex> lock(myLock);
 	myUpdatedBuffers.push_back(bufInfo);
-	myLock.unlock();
 }
 
 void
@@ -78,17 +83,37 @@ FrameQueue::updateCancelled(OP_SmartRef<TOP_Buffer>* buf)
 	myContext->returnBuffer(buf);
 }
 
+// Consumer side (main thread). The official sample returned the oldest frame,
+// which added a frame of latency whenever the producer was ahead.
 BufferInfo
 FrameQueue::getBufferToUpload()
 {
-	myLock.lock();
-
 	BufferInfo buf;
-	if (!myUpdatedBuffers.empty())
+	OP_SmartRef<TOP_Buffer> dropped[MaxQueueSize];
+	size_t numDropped = 0;
+
 	{
-		buf = myUpdatedBuffers.front();
-		myUpdatedBuffers.pop_front();
+		std::lock_guard<std::mutex> lock(myLock);
+
+		if (!myUpdatedBuffers.empty())
+		{
+			buf = std::move(myUpdatedBuffers.back());
+			myUpdatedBuffers.pop_back();
+		}
+
+		// Everything older than the newest frame is out of date.
+		while (!myUpdatedBuffers.empty())
+		{
+			if (numDropped < MaxQueueSize)
+				dropped[numDropped++] = std::move(myUpdatedBuffers.front().buf);
+			myUpdatedBuffers.pop_front();
+		}
 	}
-	myLock.unlock();
+
+	// Hand the dropped buffers back so a later createOutputBuffer() can reuse
+	// them, outside the lock.
+	for (size_t i = 0; i < numDropped; i++)
+		myContext->returnBuffer(&dropped[i]);
+
 	return buf;
 }

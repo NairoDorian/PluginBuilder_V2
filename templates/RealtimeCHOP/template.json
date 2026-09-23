@@ -1,0 +1,20 @@
+{
+  "name": "RealtimeCHOP",
+  "family": "CHOP",
+  "replace": "RealtimeCHOP",
+  "main_source": "RealtimeCHOP.cpp",
+  "features": [],
+  "description": "Real-time-first CHOP (not a sample copy): generated parameters with one eval() per cook, no allocation in execute, optional worker thread with latest-wins triple buffers, cached Info strings, AVX2 CPU guard, headless tests and bench.",
+  "api_version": 10,
+  "generate_parameters": true,
+  "cmake": [
+    "td_plugin_optimize(__PLUGIN_NAME__ REALTIME)",
+    "td_plugin_add_test(__PLUGIN_NAME__ __PLUGIN_NAME___tests SOURCES tests/core_tests.cpp)",
+    "td_plugin_add_bench(__PLUGIN_NAME__ __PLUGIN_NAME___bench SOURCES bench/core_bench.cpp)"
+  ],
+  "sources": [
+    "RealtimeCHOP.cpp",
+    "RealtimeCHOP.h",
+    "RealtimeCHOPCore.h"
+  ]
+}

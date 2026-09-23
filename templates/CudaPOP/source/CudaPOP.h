@@ -20,6 +20,9 @@
 
 using namespace TD;
 
+// One instance per POP node (exactly one input). The constructor creates a CUDA
+// stream; execute() modifies the input's positions with the kernel in kernel.cu
+// and passes every buffer through.
 class CudaPOP : public POP_CPlusPlusBase
 {
 public:
@@ -41,8 +44,10 @@ public:
 											OP_InfoDATEntries *entries,
 											void* reserved) override;
 
+	// Reports myError (a CUDA error from the last cook).
 	virtual void		getErrorString(OP_String *error, void* reserved) override;
 
+	// No custom parameters in this example.
 	virtual void		setupParameters(OP_ParameterManager *manager, void* reserved) override;
 	virtual void		pulsePressed(const char *name, void* reserved) override;
 
@@ -61,5 +66,5 @@ private:
 	cudaStream_t		myStream;
 
 	POP_Context*		myContext;
-	const char*			myError;
+	std::string			myError;
 };

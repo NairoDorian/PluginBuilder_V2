@@ -9,6 +9,13 @@ ci.py — headless integration check for PluginBuilder_V2 (no TouchDesigner need
 Uses PluginBuilderCore exactly like the TouchDesigner extension does: toolchain discovery via
 settings.ini / vswhere, MSVC environment capture, BuildRunner jobs with exit codes and diagnostics.
 Exit code is non-zero on any failure, so it can run in GitHub Actions (windows-latest) as-is.
+
+Pipeline: unittest discover (29 tests) -> scaffold every template into a temp dir
+(CMakeBlocks.assemble + render_source + plugin.json) -> discover_toolchain ->
+BuildRunner(capture_vc_env with PLUGINBUILDER_BUILD=1) -> configure+build targets
+(default: BasicCHOP only; --all = every non-CUDA template; --project <dir> = existing
+Plugin_FFT-style projects). Uses the exact same Core entry points as
+PluginBuilderExt.build_plugin / compile_plugin.
 """
 
 import argparse
@@ -32,6 +39,11 @@ def log(msg):
 
 
 def load_settings():
+    """Read %APPDATA%/IntentDev/PluginBuilder/settings.ini; force PluginBuilderDir=ROOT.
+
+    Same ini that PluginBuilderExt parses in TouchDesigner, but the repo root always
+    wins so CI does not depend on a developer machine's [Paths] PluginBuilderDir.
+    """
     appdata = os.environ.get('APPDATA', '')
     ini = os.path.join(appdata, 'IntentDev', 'PluginBuilder', 'settings.ini')
     text = ''
@@ -44,26 +56,32 @@ def load_settings():
 
 
 def scaffold(template_name, meta, dest_root, settings):
+    """Materialise one template as dest_root/PluginProjects/Ci<Name>/ (CMakeLists + sources).
+
+    Mirrors create_plugin: assemble() CMakeLists, write_plugin_manifest, then
+    render_source over every file in meta['dir']/source with sanitize_op_type /
+    make_op_icon / settings [PluginInfo] placeholders.
+    """
     name = f'Ci{template_name}'
     project_dir = os.path.join(dest_root, 'PluginProjects', name)
     os.makedirs(os.path.join(project_dir, 'source'))
-    text = CMakeBlocks.assemble(name, meta['family'], ROOT.replace('\\', '/'), features=meta.get('features', []))
+    text = CMakeBlocks.assemble(name, meta['family'], ROOT.replace('\\', '/'), features=meta.get('features', []),
+                                extra_lines=core.template_cmake_lines(meta, name))
     with open(os.path.join(project_dir, 'CMakeLists.txt'), 'w', encoding='utf-8') as f:
         f.write(text)
     core.write_plugin_manifest(project_dir, {'name': name, 'family': meta['family'], 'template': template_name})
     rep = core.template_replacements(name, core.sanitize_op_type(name), name, core.make_op_icon(name),
                                      settings['plugininfo']['Author'], settings['plugininfo']['Email'])
-    src_dir = os.path.join(meta['dir'], 'source')
-    for fn in os.listdir(src_dir):
-        with open(os.path.join(src_dir, fn), 'r', encoding='utf-8', errors='replace') as f:
-            t = f.read()
-        t = core.render_source(t, meta.get('replace', template_name), name, rep)
-        with open(os.path.join(project_dir, 'source', fn.replace(meta.get('replace', template_name), name)), 'w', encoding='utf-8') as f:
-            f.write(t)
+    core.scaffold_template_files(meta, project_dir, name, rep)
     return name, project_dir
 
 
 def run_job(runner, job, timeout=900):
+    """Submit a BuildJob and pump runner.poll() until on_done fires (or timeout).
+
+    Streams ('line', ...) events to stdout; raises on a failed ('env', False, ...)
+    event so a missing vcvarsall fails fast. Timeout kills the current child.
+    """
     done = {}
     job.on_done = lambda j: done.setdefault('job', j)
     runner.submit(job)
@@ -82,6 +100,12 @@ def run_job(runner, job, timeout=900):
 
 
 def build_project(runner, project_dir, name, family):
+    """cmake -B build -G Ninja (PLUGIN_BUILDER_DIR=ROOT) then ninja -C build.
+
+    Deploy dir is a throwaway __deploy__ under the project so CI never touches a real
+    __Plugins__ next to the user's .toe. On failure, prints parse_diagnostics rows and
+    raises; on success asserts build/bin/Release/<name>.dll exists.
+    """
     samples = os.environ.get('TD_SAMPLES_DIR', 'C:/Program Files/Derivative/TouchDesigner/Samples/CPlusPlus')
     cfg_args = ['cmake', '-B', 'build', '-G', 'Ninja', f'-DPLUGIN_BUILDER_DIR={ROOT}',
                 f'-DPLUGIN_DIR={project_dir}/__deploy__', '-DCMAKE_BUILD_TYPE=Release',
@@ -104,9 +128,18 @@ def build_project(runner, project_dir, name, family):
     if not os.path.exists(dll):
         raise RuntimeError(f'{dll} not produced')
     log(f'OK {name}: {os.path.getsize(dll)} bytes in {j.duration_ms:.0f} ms ({warnings} warnings)')
+    # Projects with td_plugin_add_test targets: run them (timing gates labelled "perf" excluded).
+    if os.path.exists(os.path.join(project_dir, 'build', 'CTestTestfile.cmake')):
+        t = run_job(runner, core.BuildJob('test', ['ctest', '--test-dir', 'build', '--output-on-failure', '-LE', 'perf'],
+                                          project_dir, label=f'ctest {name}'))
+        tail = ''.join(t.output[-3:]).strip().replace('\n', ' | ')
+        if not t.ok:
+            raise RuntimeError(f'ctest failed for {name} (exit {t.returncode}): {tail}')
+        log(f'   tests OK {name}: {tail[-120:]}')
 
 
 def main():
+    """Run unit tests, scaffold all templates, optionally configure+build targets."""
     ap = argparse.ArgumentParser()
     ap.add_argument('--all', action='store_true', help='build every non-CUDA template')
     ap.add_argument('--no-build', action='store_true')

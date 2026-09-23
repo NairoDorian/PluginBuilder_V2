@@ -3,6 +3,14 @@ Headless unit tests for PluginBuilderCore (no TouchDesigner required).
 
     cd PluginBuilder_V2
     python -m unittest discover -s tests -v
+
+Contract: every test must pass (the count is reported by unittest; it is not maintained by hand
+in the docs any more). Groups: Naming/Settings/Template/CMake/Manifest/Diagnostics/File/Sdk/
+Runner/Vscode/LoaderParPersistence/Dedupe/Deploy/TdInstall/CallableJob. They pin the
+Plugin_FFT-facing behaviour — API >= 10 headers, plugin.json round-trip, rename-in-place
+safe_replace_file, BuildRunner ordering/exit codes, and the pure reload-persistence
+helpers used by PluginBuilderExt._reload_loader_fresh (v2.1.1 parameter-definition refresh).
+No TouchDesigner, no MSVC required; RunnerTests spawn only sys.executable children.
 """
 
 import json
@@ -14,13 +22,18 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, '..'))
+# Put source/ on sys.path so PluginBuilderCore and CMakeBlocks import without installation.
 sys.path.insert(0, os.path.join(ROOT, 'source'))
 
 import PluginBuilderCore as core  # noqa: E402
 import CMakeBlocks  # noqa: E402
+import ParamGen  # noqa: E402
+
+# sys.path.insert above lets `import PluginBuilderCore` resolve source/ without packaging.
 
 
 class NamingTests(unittest.TestCase):
+    """validate_plugin_name / sanitize_op_type / make_op_icon / td_project_name contracts."""
     def test_validate_plugin_name(self):
         self.assertTrue(core.validate_plugin_name('FFT')[0])
         self.assertTrue(core.validate_plugin_name('My_Plugin2')[0])
@@ -49,6 +62,7 @@ class NamingTests(unittest.TestCase):
 
 
 class SettingsTests(unittest.TestCase):
+    """parse_settings: defaults, path expansion, [DevMode], never-raises on garbage."""
     def test_parse_settings_ok(self):
         text = """
 [Paths]
@@ -81,7 +95,9 @@ LogLevel = debug
 
 
 class TemplateTests(unittest.TestCase):
+    """load_templates / render_source / #__OP_*__# placeholder completeness (API 10)."""
     def test_load_templates_from_repo(self):
+        """Repo templates/ must contain BasicCHOP (CHOP) and every template a valid family + sources."""
         templates = core.load_templates(os.path.join(ROOT, 'templates'))
         self.assertIn('BasicCHOP', templates)
         self.assertEqual(templates['BasicCHOP']['family'], 'CHOP')
@@ -100,18 +116,28 @@ class TemplateTests(unittest.TestCase):
         self.assertIn('"Fftcustom"', out)
 
     def test_templates_have_all_placeholders(self):
+        """Every template main .cpp must carry all #__OP_*__# tokens and setAPIVersion( (API 10)."""
         templates = core.load_templates(os.path.join(ROOT, 'templates'))
         for name, meta in templates.items():
             main = os.path.join(meta['dir'], 'source', f"{meta.get('replace', name)}.cpp")
             with open(main, 'r', encoding='utf-8', errors='replace') as f:
                 text = f.read()
-            for ph in ('#__OP_TYPE__#', '#__OP_LABEL__#', '#__OP_ICON__#', '#__OP_AUTHOR__#', '#__OP_EMAIL__#'):
-                self.assertIn(ph, text, f'{name}: missing {ph}')
+            # The token must sit in the real setString("...") call, not merely somewhere in the file: a
+            # token inside a comment would satisfy a substring check while the code lost it.
+            for field, ph in (('opType', '#__OP_TYPE__#'), ('opLabel', '#__OP_LABEL__#'), ('opIcon', '#__OP_ICON__#'),
+                              ('authorName', '#__OP_AUTHOR__#'), ('authorEmail', '#__OP_EMAIL__#')):
+                self.assertRegex(text, r'%s->setString\(\s*"%s"\s*\)' % (field, ph), f'{name}: {field} placeholder')
+            # ...and no placeholder may appear anywhere else (render_source would rewrite comment prose).
+            for ln in text.splitlines():
+                if '#__' in ln:
+                    self.assertIn('setString(', ln, f'{name}: placeholder outside a setString call: {ln.strip()}')
             self.assertIn('setAPIVersion(', text, f'{name}: not an API-10 style template')
 
 
 class CMakeTests(unittest.TestCase):
+    """CMakeBlocks.assemble output shape + presence of cmake/TDPlugin.cmake & TDDeploy.cmake."""
     def test_assemble(self):
+        """HEADER first line + project() + td_add_plugin + include(TDPlugin.cmake) + PLUGIN_BUILDER_DIR."""
         text = CMakeBlocks.assemble('Fft', 'CHOP', 'C:/PB', features=['python'], extra_lines=['# hi'])
         self.assertTrue(text.startswith("# {'plugin_type': 'CHOP'}"))
         self.assertIn('project(Fft LANGUAGES CXX)', text)
@@ -121,16 +147,20 @@ class CMakeTests(unittest.TestCase):
         self.assertTrue(text.rstrip().endswith('# hi'))
 
     def test_assemble_no_features(self):
+        """Empty features must omit the FEATURES keyword (no trailing space before ')')."""
         text = CMakeBlocks.assemble('X', 'POP', 'C:/PB')
         self.assertIn('td_add_plugin(X FAMILY POP)', text)
 
     def test_module_exists(self):
+        """Shared CMake modules must ship with the repo (CMakeBlocks includes them by path)."""
         self.assertTrue(os.path.exists(os.path.join(ROOT, 'cmake', 'TDPlugin.cmake')))
         self.assertTrue(os.path.exists(os.path.join(ROOT, 'cmake', 'TDDeploy.cmake')))
 
 
 class ManifestTests(unittest.TestCase):
+    """plugin.json round-trip + safe parsing of the legacy CMakeLists first-line header."""
     def test_header_parse(self):
+        """plugin_type_from_cmake_header: valid family, unknown family, non-header, non-literal."""
         self.assertEqual(core.plugin_type_from_cmake_header("# {'plugin_type': 'CHOP'}\n"), 'CHOP')
         self.assertIsNone(core.plugin_type_from_cmake_header("# {'plugin_type': 'XXX'}"))
         self.assertIsNone(core.plugin_type_from_cmake_header("cmake_minimum_required(VERSION 3.21)"))
@@ -152,6 +182,7 @@ class ManifestTests(unittest.TestCase):
 
 
 class DiagnosticsTests(unittest.TestCase):
+    """parse_diagnostics / summarize_diagnostics over MSVC, LNK, CMake and ninja output."""
     def test_msvc_and_linker(self):
         lines = [
             'C:/proj/source/FFT.cpp(123,45): error C2065: \'foo\': undeclared identifier\n',
@@ -181,7 +212,9 @@ class DiagnosticsTests(unittest.TestCase):
 
 
 class FileTests(unittest.TestCase):
+    """safe_replace_file rename-in-place hot swap + cleanup_old_files (.old removal)."""
     def test_safe_replace_file(self):
+        """Rename-in-place: new -> unchanged -> replaced(.old) -> cleanup_old_files."""
         d = tempfile.mkdtemp()
         try:
             src = os.path.join(d, 'new.dll')
@@ -207,19 +240,31 @@ class FileTests(unittest.TestCase):
 
 
 class SdkTests(unittest.TestCase):
+    """include/ SDK headers: CHOP API >= 10, Common >= 3 (TD 2025.33230+), POP present; mismatch message."""
     def test_read_sdk_versions(self):
-        v = core.read_sdk_versions(os.path.join(ROOT, 'include'))
+        """include/ headers: family API >= 10, Common >= 3 with its BitMaskFlags.h, POP present."""
+        inc = os.path.join(ROOT, 'include')
+        v = core.read_sdk_versions(inc)
         self.assertGreaterEqual(v.get('CHOP', 0), 10)
-        self.assertEqual(v.get('Common'), 2)
+        self.assertGreaterEqual(v.get('Common') or 0, 3)
         self.assertIn('POP', v)
+        # CPlusPlus_Common.h (Common 3) #includes BitMaskFlags.h; a sync that forgot it would not compile.
+        self.assertTrue(os.path.exists(os.path.join(inc, 'BitMaskFlags.h')))
+        with open(os.path.join(inc, 'sdk_versions.json'), 'r', encoding='utf-8') as f:
+            rec = json.load(f)
+        self.assertIn('td_build', rec)
+        self.assertEqual(rec['versions'].get('Common'), v.get('Common'))
 
     def test_mismatch_message(self):
+        """sdk_mismatch_message is empty on agreement, names family + versions otherwise."""
         self.assertEqual(core.sdk_mismatch_message({'CHOP': 10}, {'CHOP': 10}), '')
         self.assertIn('CHOP: 9 vs installed 10', core.sdk_mismatch_message({'CHOP': 9}, {'CHOP': 10}))
 
 
 class RunnerTests(unittest.TestCase):
+    """BuildRunner: FIFO job order, exit-code propagation, env-failure event."""
     def test_runner_runs_jobs_in_order_and_reports_exit_codes(self):
+        """FIFO: first submitted job finishes first; returncode and captured stdout/stderr preserved."""
         env = dict(os.environ)
         runner = core.BuildRunner(lambda: env, capture_output=True, use_job_object=False)
         runner.start()
@@ -245,6 +290,7 @@ class RunnerTests(unittest.TestCase):
         self.assertGreater(j2.duration_ms, 0)
 
     def test_env_failure_is_reported(self):
+        """env_factory raising (e.g. missing vcvarsall) emits ('env', False, msg) as the first event."""
         def bad():
             raise RuntimeError('no vcvarsall')
         runner = core.BuildRunner(bad, capture_output=True, use_job_object=False)
@@ -260,7 +306,204 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(events[0][1])
 
 
+class DeployTests(unittest.TestCase):
+    """files_identical fast paths, .old slot allocation, runtime-DLL manifest, output coalescing."""
+    def test_files_identical_fast_paths(self):
+        d = tempfile.mkdtemp()
+        try:
+            a, b = os.path.join(d, 'a'), os.path.join(d, 'b')
+            with open(a, 'wb') as f:
+                f.write(b'abc')
+            shutil.copy2(a, b)                                   # same size, same mtime -> no hash needed
+            self.assertTrue(core.files_identical(a, b))
+            with open(b, 'wb') as f:
+                f.write(b'abcd')                                 # different size -> different
+            self.assertFalse(core.files_identical(a, b))
+            with open(b, 'wb') as f:
+                f.write(b'abd')                                  # same size, new mtime -> hashed -> different
+            os.utime(b, ns=(os.stat(a).st_atime_ns, os.stat(a).st_mtime_ns + 10_000_000))
+            self.assertFalse(core.files_identical(a, b))
+            with open(b, 'wb') as f:
+                f.write(b'abc')                                  # same content, different mtime -> hashed -> same
+            os.utime(b, ns=(os.stat(a).st_atime_ns, os.stat(a).st_mtime_ns + 10_000_000))
+            self.assertTrue(core.files_identical(a, b))
+            self.assertFalse(core.files_identical(a, os.path.join(d, 'missing')))
+        finally:
+            shutil.rmtree(d)
+
+    def test_old_slot_and_keep_old_false(self):
+        d = tempfile.mkdtemp()
+        try:
+            src, dst = os.path.join(d, 's.dll'), os.path.join(d, 'p.dll')
+            with open(src, 'wb') as f:
+                f.write(b'1')
+            core.safe_replace_file(src, dst)
+            with open(src, 'wb') as f:
+                f.write(b'22')
+            changed, note = core.safe_replace_file(src, dst, keep_old=False)
+            self.assertTrue(changed)
+            self.assertFalse(os.path.exists(dst + '.old'))       # removed because keep_old=False
+            self.assertEqual(core._free_old_slot(dst), dst + '.old')
+        finally:
+            shutil.rmtree(d)
+
+    def test_runtime_dll_manifest(self):
+        d = tempfile.mkdtemp()
+        try:
+            self.assertIsNone(core.read_runtime_dll_manifest(d, 'FFT'))
+            with open(os.path.join(d, 'FFT_runtime_dlls.txt'), 'w') as f:
+                f.write('libfftw3f-3.3.11-avx2.dll\n\nLIBFFTW3F-3.3.11-AVX2.dll\nother.dll\n')
+            self.assertEqual(core.read_runtime_dll_manifest(d, 'FFT'), ['libfftw3f-3.3.11-avx2.dll', 'other.dll'])
+        finally:
+            shutil.rmtree(d)
+
+    def test_coalesce_output(self):
+        text, dropped = core.coalesce_output(['a', 'b\n'], 10)
+        self.assertEqual((text, dropped), ('a\nb\n', 0))
+        text, dropped = core.coalesce_output([f'l{i}' for i in range(250)], 200)
+        self.assertEqual(dropped, 50)
+        self.assertEqual(text.count('\n'), 201)
+        self.assertIn('50 more line(s)', text)
+
+
+class TdInstallTests(unittest.TestCase):
+    """find_td_installs: versioned folders sorted newest first, unversioned last, samples required."""
+    def test_find_td_installs(self):
+        d = tempfile.mkdtemp()
+        try:
+            for name, samples in (('TouchDesigner.2025.33230', True), ('TouchDesigner.2025.9000', True),
+                                  ('TouchDesigner', True), ('TouchDesigner.2026.100', False), ('Other', True)):
+                os.makedirs(os.path.join(d, name, 'Samples', 'CPlusPlus') if samples else os.path.join(d, name))
+            found = core.find_td_installs([d])
+            self.assertEqual([os.path.basename(p) for _b, p in found],
+                             ['TouchDesigner.2025.33230', 'TouchDesigner.2025.9000', 'TouchDesigner'])
+            self.assertEqual(core.td_build_label(found[0][0]), '2025.33230')
+            self.assertEqual(core.td_build_label(found[-1][0]), 'unversioned')
+        finally:
+            shutil.rmtree(d)
+
+
+class CallableJobTests(unittest.TestCase):
+    """BuildRunner 'call' jobs run in-process on the runner thread; errors become returncode -1."""
+    def test_call_jobs_and_pending_kinds(self):
+        import threading
+        import time
+        runner = core.BuildRunner(lambda: dict(os.environ), capture_output=True, use_job_object=False)
+        gate = threading.Event()
+        seen = []
+
+        def slow(job, emit):
+            gate.wait(5)
+            emit('working')
+            job.result = threading.current_thread().name
+            return 0
+
+        def boom(job, emit):
+            raise PermissionError('locked')
+
+        j1 = core.BuildJob('call', [], os.getcwd(), func=slow, on_done=seen.append)
+        j3 = core.BuildJob('call', [], os.getcwd(), func=boom, on_done=seen.append)
+        runner.submit(j1)
+        runner.submit(j3)
+        self.assertEqual(runner.pending_kinds(), ['call', 'call'])
+        runner.start()
+        t0 = time.time()
+        while runner.current_job is None and time.time() - t0 < 10:
+            time.sleep(0.01)
+        self.assertEqual(runner.pending_kinds(), ['call'])        # j1 started, j3 still queued
+        gate.set()
+        while len(seen) < 2 and time.time() - t0 < 20:
+            runner.poll()
+            time.sleep(0.01)
+        runner.shutdown()
+        self.assertEqual(seen[0], j1)
+        self.assertEqual(j1.returncode, 0)
+        self.assertEqual(j1.result, 'PluginBuilder-BuildRunner')   # ran on the runner thread
+        self.assertIn('working\n', j1.output)
+        self.assertEqual(j3.returncode, -1)
+        self.assertIsInstance(j3.error, PermissionError)
+
+
+class ParamGenTests(unittest.TestCase):
+    """parameters.json -> Parameters.h/.cpp (source/ParamGen.py) and template project scaffolding."""
+    SPEC = {'pages': [{'name': 'Main', 'pars': [
+        {'name': 'Mode', 'type': 'menu', 'enum': 'Mode', 'items': [['Rms', 'RMS'], ['Peak', 'Peak']], 'default': 'Peak'},
+        {'name': 'Gain', 'type': 'float', 'default': 1.5, 'min': 0, 'max': 4, 'clamp': [0, 10]},
+        {'name': 'Count', 'type': 'int', 'default': 3, 'field': 'count'},
+        {'name': 'Smooth', 'type': 'toggle', 'default': True},
+        {'name': 'Attackms', 'type': 'float', 'default': 10, 'field': 'attackMs', 'enable_if': 'v.smooth'},
+        {'name': 'Reset', 'type': 'pulse'}]}]}
+
+    def test_generate(self):
+        h, c = ParamGen.generate(self.SPEC)
+        self.assertIn('enum class Mode : int { Rms = 0, Peak, COUNT };', h)
+        self.assertIn('constexpr char GainName[] = "Gain";', h)
+        self.assertIn('double gain = 1.5;', h)
+        self.assertIn('int count = 3;', h)
+        self.assertIn('bool smooth = true;', h)
+        self.assertIn('Mode mode = Mode::Peak;', h)
+        self.assertNotIn('reset', h.split('struct Values')[1].split('};')[0])        # pulses carry no value
+        self.assertIn('static_assert(sizeof(kModeNames)', c)
+        self.assertIn('v.gain = std::clamp(inputs->getParDouble(GainName), 0.0, 10.0);', c)
+        self.assertIn('state->setEnableState(AttackmsName, static_cast<bool>(v.smooth));', c)
+        self.assertIn('manager->appendPulse(np);', c)
+        # menus fall back to the default on an out-of-range stored index
+        self.assertIn('static_cast<int>(Mode::COUNT)) ? Values{}.mode', c)
+
+    def test_validation(self):
+        bad = [{'pages': []},
+               {'pages': [{'name': 'P', 'pars': [{'name': 'gain', 'type': 'float'}]}]},          # not Capitalised
+               {'pages': [{'name': 'P', 'pars': [{'name': 'Gain', 'type': 'string'}]}]},         # unsupported type
+               {'pages': [{'name': 'P', 'pars': [{'name': 'Gain', 'type': 'float'}, {'name': 'Gain', 'type': 'int'}]}]},
+               {'pages': [{'name': 'P', 'pars': [{'name': 'Mode', 'type': 'menu', 'items': [['A', 'a']], 'default': 'B'}]}]}]
+        for spec in bad:
+            with self.assertRaises(ParamGen.SpecError):
+                ParamGen.generate(spec)
+
+    def test_generate_files_skips_unchanged(self):
+        d = tempfile.mkdtemp()
+        try:
+            spec = os.path.join(d, 'parameters.json')
+            with open(spec, 'w') as f:
+                json.dump(self.SPEC, f)
+            h, c = ParamGen.generate_files(spec, d)
+            m1 = os.stat(h).st_mtime_ns
+            os.utime(h, ns=(m1 - 10_000_000_000, m1 - 10_000_000_000))
+            ParamGen.generate_files(spec, d)
+            self.assertEqual(os.stat(h).st_mtime_ns, m1 - 10_000_000_000)   # unchanged: not rewritten
+        finally:
+            shutil.rmtree(d)
+
+    def test_realtime_template_scaffold(self):
+        """RealtimeCHOP ships project files + parameters.json; scaffolding generates Parameters.h/.cpp."""
+        templates = core.load_templates(os.path.join(ROOT, 'templates'))
+        meta = templates['RealtimeCHOP']
+        self.assertTrue(meta.get('generate_parameters'))
+        d = tempfile.mkdtemp()
+        try:
+            rep = core.template_replacements('Meter', 'Meter', 'Meter', 'MET', 'A', 'e')
+            files = core.scaffold_template_files(meta, d, 'Meter', rep)
+            for rel in ('source/Meter.cpp', 'source/Meter.h', 'source/MeterCore.h', 'parameters.json',
+                        'tests/core_tests.cpp', 'bench/core_bench.cpp', 'source/Parameters.h', 'source/Parameters.cpp'):
+                self.assertIn(rel, files)
+                self.assertTrue(os.path.exists(os.path.join(d, rel)), rel)
+            with open(os.path.join(d, 'source', 'Meter.cpp'), encoding='utf-8') as f:
+                text = f.read()
+            self.assertIn('#include "MeterCore.h"', open(os.path.join(d, 'source', 'Meter.h'), encoding='utf-8').read())
+            self.assertIn('opType->setString("Meter")', text)
+            lines = core.template_cmake_lines(meta, 'Meter')
+            self.assertIn('td_plugin_optimize(Meter REALTIME)', lines)
+            self.assertIn('td_plugin_add_test(Meter Meter_tests SOURCES tests/core_tests.cpp)', lines)
+        finally:
+            shutil.rmtree(d)
+
+    def test_cuda_projects_enable_cuda_at_directory_scope(self):
+        self.assertIn('project(X LANGUAGES CXX CUDA)', CMakeBlocks.assemble('X', 'TOP', '/pb', features=['cuda']))
+        self.assertIn('project(X LANGUAGES CXX)', CMakeBlocks.assemble('X', 'TOP', '/pb'))
+
+
 class VscodeTests(unittest.TestCase):
+    """render_vscode_files produces serialisable launch/IntelliSense configs."""
     def test_render(self):
         files = core.render_vscode_files('Fft', 'C:/TD/TouchDesigner.exe', 'C:/p/x.toe', 'C:/p', 'C:/PB/include')
         self.assertIn('launch.json', files)
@@ -270,7 +513,11 @@ class VscodeTests(unittest.TestCase):
 
 
 class LoaderParPersistenceTests(unittest.TestCase):
-    """Pure logic for which loader parameters survive a fresh-node reload, and snapshot/restore."""
+    """Pure logic for which loader parameters survive a fresh-node reload, and snapshot/restore.
+
+    Feeds PluginBuilderExt._snapshot_loader_values / _restore_loader_values (v2.1.1
+    hot-reload parameter-definition refresh). Classification must ignore ParMode entirely.
+    """
 
     def test_is_persisted_par_classification(self):
         is_p = core.is_persisted_par
@@ -338,6 +585,7 @@ class LoaderParPersistenceTests(unittest.TestCase):
 
 
 class DedupeTests(unittest.TestCase):
+    """dedupe_consecutive collapses only immediate repeats (MSVC warning blocks)."""
     def test_collapses_only_immediate_duplicates(self):
         src = ['a', 'a', 'b', 'a', 'c', 'c', 'c', '']
         self.assertEqual(list(core.dedupe_consecutive(src)), ['a', 'b', 'a', 'c', ''])
@@ -346,4 +594,5 @@ class DedupeTests(unittest.TestCase):
 
 
 if __name__ == '__main__':
+    # Direct run: python tests/test_core.py -v  (same 29 tests as unittest discover)
     unittest.main()

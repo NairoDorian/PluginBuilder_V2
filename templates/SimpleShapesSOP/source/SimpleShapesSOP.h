@@ -19,6 +19,9 @@
 using namespace TD;
 
 // To get more help about these functions, look at SOP_CPlusPlusBase.h
+// One instance per SOP node. Each cook calls either execute() (CPU geometry,
+// usable by other SOPs) or executeVBO() (GPU Direct: render-only VBOs), depending
+// on SOP_GeneralInfo::directToGPU set in getGeneralInfo().
 class SimpleShapesSOP : public SOP_CPlusPlusBase
 {
 public:

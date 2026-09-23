@@ -36,11 +36,18 @@ SOFTWARE.
 #
 # Log prefixes: [Init] [Create] [Build] [Compile] [Build→Copy] [Install] [Source] [CMake]
 #               [Runner] [ParamSync] [Cleanup] [Test]
+#
+# Contracts: PLUGIN_BUILDER_DIR / td_add_plugin / __Plugins__ deploy / PLUGINBUILDER_BUILD=1
+# env and plugin.json schema live in PluginBuilderCore + cmake/TDPlugin.cmake; this file is
+# the TD-only surface. Sibling repo ../Plugin_FFT is a consumer of that contract (never
+# modified here). Known facts: API 10 headers, CMake+Ninja+MSVC, v2.1.4; v2.1.1 added the
+# hot-reload parameter-definition refresh (_reload_loader_fresh).
 # =================================================================================================
 
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -51,6 +58,11 @@ import time
 # -------------------------------------------------------------------------------------------------
 
 def _load_module_from(path, name):
+    """Import a .py by filesystem path and register it in sys.modules under `name`.
+
+    Lets the .tox run the on-disk source/PluginBuilderCore.py even when its embedded DAT
+    copy is stale (dev loop: edit file -> reload COMP -> new code without re-export).
+    """
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -59,6 +71,11 @@ def _load_module_from(path, name):
 
 
 def _import_support_module(name, plugin_builder_dir):
+    """Load source/<name>.py when present, else fall back to the embedded DAT module.
+
+    plugin_builder_dir comes from _peek_plugin_builder_dir (pre-parse settings peek).
+    Failures loading the file fall back to __import__(name) with an [Init] WARNING.
+    """
     candidate = os.path.join(plugin_builder_dir or '', 'source', f'{name}.py')
     if plugin_builder_dir and os.path.exists(candidate):
         try:
@@ -79,7 +96,11 @@ def _import_support_module(name, plugin_builder_dir):
 
 def _par_mode():
     """Return td.ParMode (a TouchDesigner builtin) if available, else None — used to normalize a
-    parameter's mode onto the PAR_* sentinels before calling the pure Core helpers."""
+    parameter's mode onto the PAR_* sentinels before calling the pure Core helpers.
+
+    Resolution order: module globals (TD injects builtins) then `import td`.
+    Module-level on purpose: _snapshot_loader_values / _restore_loader_values call it by bare name.
+    """
     pm = globals().get('ParMode')
     if pm is None:
         try:
@@ -90,12 +111,15 @@ def _par_mode():
     return pm
 
 
-STATUS_PAGE = 'Status'
+STATUS_PAGE = 'Status'   # custom page name for Buildstatus / Lastbuild / Loadeddll / pulses
 
 
 class PluginBuilderExt:
     """
     Creates, builds, compiles, hot-reloads and installs C++ plugins for TouchDesigner.
+
+    Loaded as the COMP's Extension (ownerComp passed by TD). Public method names are part
+    of the .tox contract (parexec / folder DAT / execute DAT call them by name) — do not rename.
 
     Lifecycle:
         1. create_plugin()   — scaffold a project from a template (CMakeLists via TDPlugin.cmake, plugin.json,
@@ -105,13 +129,22 @@ class PluginBuilderExt:
         4. _do_copy_plugin() — hash-gated, rename-in-place copy of the DLL (+ runtime DLLs) into __Plugins__/
                                and re-init of the plugin_loader op; then parameter sync
         5. install_plugin()  — copy to ~/Documents/Derivative/Plugins/<name>/
+
+    Cross-refs: pure logic in PluginBuilderCore (same names); CMake text from CMakeBlocks;
+    deploy algorithm shared with cmake/TDDeploy.cmake. Consumer: sibling ../Plugin_FFT.
     """
 
     # ========================================================================================== #
     #  INITIALIZATION                                                                            #
+    #  Runs once per COMP instance (extension constructor). Heavy work is deferred: DAT        #
+    #  refresh is delayFrames=120; first sync_custom_parameters() is immediate but cheap       #
+    #  when no loader exists yet.                                                              #
     # ========================================================================================== #
 
     def __init__(self, ownerComp):
+        """Wire DATs, settings, Core modules, dispatch maps, toolchain, templates, SDK check."""
+        # ownerComp is the PluginBuilder COMP; builder/ holds settings + folder DATs,
+        # source/ holds the file-watching DATs used for auto-rebuild.
         self.ownerComp = ownerComp
         self.builderComp = ownerComp.op('builder')
         self.SettingsDat = self.builderComp.op('settings')
@@ -133,7 +166,7 @@ class PluginBuilderExt:
         self.mirror_pages = str(self.settings['options'].get('MirrorPages', 'true')).lower() not in ('0', 'false', 'no')
 
         # --- state ---
-        self.runner = None
+        self.runner = None                 # BuildRunner (background thread + main-thread poll)
         self.process = None                     # legacy attribute (some callbacks test it)
         self.queue = None
         self.loader_op = self.ownerComp.op('plugin_loader')
@@ -148,7 +181,7 @@ class PluginBuilderExt:
         self._last_configure_hash = None
         self._loaded_dll_hash = None
 
-        # --- dispatch maps ---
+        # --- dispatch maps: parameter name -> handler (OnParValueChange / OnParPulse) ---
         self.on_par_value_change_map = {
             'Outputto': self.onOutputto,
             'Pluginname': self.onPluginname,
@@ -164,6 +197,8 @@ class PluginBuilderExt:
             'Cleanbuild': self.clean_build,
             'Runtests': self.run_tests,
             'Reloadplugin': lambda: self._do_copy_plugin(force=True),
+            'Generateparams': self.generate_parameters,
+            'Bakeplugin': self.bake_plugin,
         }
 
         # --- loader op types by plugin family (POP guarded: older TD builds have no POPs) ---
@@ -177,7 +212,7 @@ class PluginBuilderExt:
         if pop_loader is not None:
             self.loader_op_map['POP'] = {'loader': pop_loader, 'in': globals().get('inPOP'), 'out': globals().get('outPOP')}
 
-        # --- directory conventions ---
+        # --- directory conventions (relative to project.folder) ---
         self.plugin_projects_dir = 'PluginProjects'
         self.plugins_dir = '__Plugins__'
 
@@ -200,6 +235,7 @@ class PluginBuilderExt:
         self._ensure_status_pars()
 
         # --- deferred DAT refresh + parameter sync ---
+        # 120 frames: let the COMP finish loading before force-cooking folder DATs.
         run("args[0].RefreshDats()", self.ownerComp, delayFrames=120)
         self.sync_custom_parameters()
 
@@ -212,6 +248,7 @@ class PluginBuilderExt:
             self._set_status('Toolchain not configured — see textport')
 
     def __del__(self):
+        """Best-effort runner teardown when the extension object is collected."""
         try:
             self.close_subprocess()
         except Exception:  # noqa: BLE001
@@ -219,17 +256,26 @@ class PluginBuilderExt:
 
     # ========================================================================================== #
     #  LOGGING / STATUS                                                                          #
+    #  _log always prints; _debug only when LogLevel=debug; status/errors/warnings also land  #
+    #  on the COMP so the UI and script logs stay in sync.                                     #
     # ========================================================================================== #
 
     @staticmethod
     def _log(tag, message):
+        """Always print '[tag] message' to the textport (public log channel)."""
         print(f"[{tag}] {message}")
 
     def _debug(self, tag, message):
+        """Print only when [Options] LogLevel == debug (self.verbose)."""
         if self.verbose:
             print(f"[{tag}] {message}")
 
     def _ensure_status_pars(self):
+        """Create the Status page + Buildstatus/Lastbuild/Loadeddll str + pulse pars if missing.
+
+        Idempotent (skips names that already exist); failures are debug-logged only so a
+        locked COMP still finishes __init__.
+        """
         try:
             page = None
             for p in self.ownerComp.customPages:
@@ -253,10 +299,15 @@ class PluginBuilderExt:
                 page.appendPulse('Reloadplugin', label='Force Reload Plugin (fresh parameter definitions)')
             if 'Runtests' not in existing:
                 page.appendPulse('Runtests', label='Run Tests (ctest)')
+            if 'Generateparams' not in existing:
+                page.appendPulse('Generateparams', label='Generate Parameters (parameters.json)')
+            if 'Bakeplugin' not in existing:
+                page.appendPulse('Bakeplugin', label='Bake for Performance (standalone node)')
         except Exception as e:  # noqa: BLE001
             self._debug('Init', f'status pars not created: {e}')
 
     def _set_status(self, text):
+        """Update Buildstatus (also caches _last_status for callers that cannot touch pars)."""
         self._last_status = text
         try:
             self.ownerComp.par.Buildstatus = text
@@ -264,6 +315,7 @@ class PluginBuilderExt:
             pass
 
     def _set_error(self, message):
+        """Log [Build] ERROR and surface via addError/addScriptError (tries both)."""
         self._log('Build', f'ERROR: {message}')
         for fn in ('addError', 'addScriptError'):
             try:
@@ -273,6 +325,7 @@ class PluginBuilderExt:
                 continue
 
     def _set_warning(self, message):
+        """Log [Build] WARNING and surface via addWarning/addScriptWarning."""
         self._log('Build', f'WARNING: {message}')
         for fn in ('addWarning', 'addScriptWarning'):
             try:
@@ -282,6 +335,7 @@ class PluginBuilderExt:
                 continue
 
     def _clear_errors(self):
+        """Clear script errors on the COMP (recurse=False) before a new build attempt."""
         for fn in ('clearScriptErrors',):
             try:
                 getattr(self.ownerComp, fn)(recurse=False)
@@ -289,6 +343,7 @@ class PluginBuilderExt:
                 pass
 
     def _errors_dat(self):
+        """Get-or-create builder/build_errors tableDAT (diagnostics sink for the UI)."""
         dat = self.builderComp.op('build_errors')
         if dat is None:
             try:
@@ -299,6 +354,7 @@ class PluginBuilderExt:
         return dat
 
     def _publish_diagnostics(self, diags):
+        """Rewrite build_errors with parse_diagnostics rows (severity/file/line/col/code/message)."""
         dat = self._errors_dat()
         if dat is None:
             return
@@ -312,10 +368,14 @@ class PluginBuilderExt:
 
     # ========================================================================================== #
     #  PROPERTIES                                                                                #
+    #  Path conventions: project.folder is the .toe directory; work lives under                #
+    #  PluginProjects/<name>/ (CMakeLists.txt, source/, build/bin/<Config>/) and deploys to    #
+    #  __Plugins__/<name>/<name>.dll.                                                           #
     # ========================================================================================== #
 
     @staticmethod
     def _peek_plugin_builder_dir(settings_text):
+        """Cheap [Paths] PluginBuilderDir peek used BEFORE parse_settings to locate source/*.py."""
         for line in (settings_text or '').splitlines():
             if line.strip().lower().startswith('pluginbuilderdir'):
                 _, _, v = line.partition('=')
@@ -422,10 +482,16 @@ class PluginBuilderExt:
 
     # ========================================================================================== #
     #  PATH / TOOLCHAIN VALIDATION                                                               #
+    #  Never raises: missing tools are textport errors + PathsValid=False so create/build     #
+    #  fail with a clear status instead of an exception.                                       #
     # ========================================================================================== #
 
     def check_paths(self):
-        """Resolve the toolchain (settings.ini > vswhere > PATH > VS-bundled). Never raises."""
+        """Resolve the toolchain (settings.ini > vswhere > PATH > VS-bundled). Never raises.
+
+        Sets self.PathsValid; failures are printed to the textport (Init) so a missing
+        vcvarsall/ninja is visible without opening a dialog. Called from __init__.
+        """
         paths = self.settings['paths']
         ok = True
         if not paths.get('PluginBuilderDir') or not os.path.isdir(paths['PluginBuilderDir']):
@@ -442,6 +508,11 @@ class PluginBuilderExt:
         return ok
 
     def _check_sdk_versions(self):
+        """Warn (textport + addWarning) when include/ headers differ from the running TD.
+
+        Message comes from PluginBuilderCore.sdk_mismatch_message and tells the user to
+        re-run dev/sync_templates.py. No-op if TD samples dir is unavailable.
+        """
         samples = self.TDSamplesDir
         if not samples or not os.path.isdir(samples) or not self.sdk_versions:
             return
@@ -452,6 +523,7 @@ class PluginBuilderExt:
             self._set_warning(msg)
 
     def _populate_template_menu(self):
+        """Fill Plugintemplate menu from load_templates(); keep the current selection if valid."""
         try:
             par = self.ownerComp.par.Plugintemplate
             names = list(self.templates.keys())
@@ -466,10 +538,17 @@ class PluginBuilderExt:
 
     # ========================================================================================== #
     #  PLUGIN CREATION                                                                           #
+    #  create_plugin is the only writer of a new PluginProjects/<name>/ tree.                  #
     # ========================================================================================== #
 
     def create_plugin(self):
-        """Scaffold a new plugin project from a template and kick off the first configure + build."""
+        """Scaffold a new plugin project from a template and kick off the first configure + build.
+
+        Steps: validate name + toolchain -> resolve template/meta/family -> make
+        PluginProjects/<name>/{CMakeLists.txt, plugin.json, source/*, .vscode/, launch.vs.json}
+        with render_source placeholders -> create_plugin_loader(family) -> build_plugin(then_compile=True).
+        On any failure after mkdir, the project dir is removed before re-raising.
+        """
         name = self.Pluginname
         ok, msg = self.core.validate_plugin_name(name)
         if not ok:
@@ -506,9 +585,9 @@ class PluginBuilderExt:
 
         try:
             # --- CMakeLists.txt (tiny; includes cmake/TDPlugin.cmake) + plugin.json manifest ---
-            extra = []
-            if 'cuda' not in meta.get('features', []):
-                extra.append(f'# td_plugin_optimize({name} AVX2 FAST_MATH)')
+            extra = self.core.template_cmake_lines(meta, name)
+            if not extra and 'cuda' not in meta.get('features', []):
+                extra.append(f'# td_plugin_optimize({name} REALTIME)   # AVX2 + fast math + LTO; pair with td_cpu_guard.h')
             cmake_text = self.cmake_blocks.assemble(name, family, self.PluginBuilderDir,
                                                     features=meta.get('features', []), extra_lines=extra)
             with open(f"{self.working_dir}/CMakeLists.txt", 'w', encoding='utf-8') as f:
@@ -527,21 +606,12 @@ class PluginBuilderExt:
             self._write_vscode_files()
 
             # --- template sources ---
-            os.makedirs(f"{self.working_dir}/source")
             replacements = self.core.template_replacements(
                 name, op_type, name, op_icon,
                 self.settings['plugininfo']['Author'], self.settings['plugininfo']['Email'],
                 self.settings['plugininfo'].get('HelpURL', ''))
-            src_dir = os.path.join(meta['dir'], 'source')
-            files = sorted(os.listdir(src_dir))
-            for file_name in files:
-                with open(os.path.join(src_dir, file_name), 'r', encoding='utf-8', errors='replace') as f:
-                    text = f.read()
-                text = self.core.render_source(text, meta.get('replace', template_name), name, replacements)
-                out_name = file_name.replace(meta.get('replace', template_name), name)
-                with open(f"{self.working_dir}/source/{out_name}", 'w', encoding='utf-8') as f:
-                    f.write(text)
-            self._log('Create', f"Copied {len(files)} template source file(s)")
+            files = self.core.scaffold_template_files(meta, self.working_dir, name, replacements)
+            self._log('Create', f"Copied {len(files)} template file(s)")
 
             os.makedirs(self.plugin_dir, exist_ok=True)
         except Exception as e:  # noqa: BLE001
@@ -557,12 +627,14 @@ class PluginBuilderExt:
         self._log('Create', f"Plugin '{name}' created (opType='{op_type}') — configuring + compiling")
 
     def _op_type_collides(self, op_type, family):
+        """True if a built-in operator already occupies this opType (e.g. 'fft' + 'CHOP')."""
         try:
             return globals().get(f"{op_type.lower()}{family}") is not None
         except Exception:  # noqa: BLE001
             return False
 
     def _write_launch_vs_json(self):
+        """Instantiate source/launch.vs.json template into the project (Visual Studio launch)."""
         with open(f"{self.PluginBuilderDir}/source/launch.vs.json", 'r', encoding='utf-8') as f:
             launch = json.load(f)
         project_name = self.TDProjectName
@@ -575,6 +647,7 @@ class PluginBuilderExt:
             json.dump(launch, f, indent=4)
 
     def _write_vscode_files(self):
+        """Write .vscode/{launch,c_cpp_properties,settings}.json via Core.render_vscode_files."""
         toe = f"{project.folder}/{self.TDProjectName}.toe"
         files = self.core.render_vscode_files(self.Pluginname, self.TDPath, toe, project.folder,
                                               self.include_dir.replace('\\', '/'))
@@ -585,13 +658,21 @@ class PluginBuilderExt:
                 json.dump(data, f, indent=4)
 
     def destroy_children(self):
+        """Destroy depth-1 children except the preserved builder/source/CMakeLists DATs."""
         preserved = ['builder', 'source', 'CMakeLists']
         for child in self.ownerComp.findChildren(depth=1):
             if child.name not in preserved:
                 child.destroy()
 
     def create_plugin_loader(self, plugin_type):
-        """Create the loader chain (optional in → cplusplus loader → out) for a family."""
+        """Create the loader chain (optional in → cplusplus loader → out) for a family.
+
+        viewer=True is load-bearing (not cosmetic): the loader must cook every frame or
+        Info CHOP/DAT / middle-click popup callbacks never run (see the long comment at
+        the assignment). DLL path is __Plugins__/<name>/<name>.dll; unloadplugin tracks
+        whether that file exists yet. Cross-refs: loader_op_map built in __init__,
+        sync_custom_parameters re-resolves by the fixed name 'plugin_loader'.
+        """
         info = self.loader_op_map.get(plugin_type)
         if info is None:
             self._set_error(f'No loader available for family {plugin_type}')
@@ -638,6 +719,7 @@ class PluginBuilderExt:
         run("args[0].ext.PluginBuilderExt.sync_custom_parameters()", self.ownerComp, delayFrames=15)
 
     # ---------------- legacy CMake assembly helpers (kept for external callers) ----------------- #
+    # Thin wrappers over CMakeBlocks.assemble; create_plugin calls cmake_blocks.assemble directly.
 
     def assemble_cmake_text_basic(self):
         return self.cmake_blocks.assemble(self.Pluginname, 'CHOP', self.PluginBuilderDir)
@@ -650,9 +732,17 @@ class PluginBuilderExt:
 
     # ========================================================================================== #
     #  BUILD & COMPILE                                                                           #
+    #  configure -> BuildRunner('configure', _configure_args) then optional compile;          #
+    #  compile  -> BuildRunner('build', _build_args) then _schedule_copy on success.          #
+    #  Both gate on _cmake_inputs_hash / pending_count to avoid redundant work.               #
     # ========================================================================================== #
 
     def _configure_args(self):
+        """cmake -B build -G Ninja with PLUGIN_BUILDER_DIR, PLUGIN_DIR, build type, compile_commands.
+
+        Adds -DTD_SAMPLES_DIR when the running TD exposes Samples/CPlusPlus (for 3rdParty lookup).
+        Displayed via cmake_build_cmd; submitted as a BuildJob('configure', ...) in build_plugin.
+        """
         args = ['cmake', '-B', 'build', '-G', 'Ninja',
                 f'-DPLUGIN_BUILDER_DIR={self.PluginBuilderDir}',
                 f'-DPLUGIN_DIR={project.folder}/{self.plugin_dir}',
@@ -664,6 +754,7 @@ class PluginBuilderExt:
         return args
 
     def _build_args(self):
+        """ninja -C build [+ -j N when [Options] ParallelJobs is a digit]."""
         args = ['ninja', '-C', 'build']
         jobs = str(self.settings['options'].get('ParallelJobs', '')).strip()
         if jobs.isdigit():
@@ -671,6 +762,11 @@ class PluginBuilderExt:
         return args
 
     def _cmake_inputs_hash(self):
+        """Cheap change key for skipping configure: build type + PluginBuilderDir + file hashes.
+
+        Compared against self._last_configure_hash in build_plugin; cleared by clean_build /
+        onPluginname when loading a different project.
+        """
         parts = [self.build_config, self.PluginBuilderDir]
         for fn in ('CMakeLists.txt', 'plugin.json'):
             p = f"{self.working_dir}/{fn}"
@@ -682,7 +778,12 @@ class PluginBuilderExt:
         return '|'.join(parts)
 
     def build_plugin(self, then_compile=False, force=False):
-        """CMake configure. Skipped when nothing relevant changed unless force=True."""
+        """CMake configure. Skipped when nothing relevant changed unless force=True.
+
+        Also self-heals a non-Ninja CMakeCache (deletes build/). On success chains to
+        compile_plugin when then_compile; on failure publishes diagnostics to
+        builder/build_errors and shows the first error in the status bar.
+        """
         if not os.path.exists(self.abs_working_dir):
             self._set_error(f"Directory {self.abs_working_dir} does not exist.")
             return
@@ -739,7 +840,13 @@ class PluginBuilderExt:
         self._schedule_poll()
 
     def compile_plugin(self):
-        """Ninja build. Coalesces repeated requests while a build is running."""
+        """Ninja build. Coalesces repeated requests while a build is running.
+
+        If a build is already current, sets _rebuild_after_current (one trailing rebuild).
+        If a configure/build is already queued, skips entirely (that queue chains to a build).
+        On success schedules the hash-gated DLL copy (_schedule_copy) unless ninja reported
+        'no work to do'; on failure prints de-duplicated diagnostics.
+        """
         if not self.CMakeListsExists:
             self._log('Compile', "SKIPPED — no CMakeLists.txt found")
             return
@@ -750,9 +857,9 @@ class PluginBuilderExt:
             self._rebuild_after_current = True
             self._debug('Compile', 'build already running — will rebuild when it finishes')
             return
-        if self.runner.pending_count > 0:
+        if any(k in ('configure', 'build') for k in self.runner.pending_kinds()):
             # A configure (or build) is already queued; the existing queue chains to a build, so
-            # don't stack a duplicate build on top of it.
+            # don't stack a duplicate build on top of it. (Staging/install jobs do not count.)
             self._debug('Compile', 'build skipped — a configure/build is already queued')
             return
 
@@ -795,9 +902,11 @@ class PluginBuilderExt:
         self._schedule_poll()
 
     def BuildAndCompile(self):
+        """Force configure + build (ignores the inputs-hash skip)."""
         self.build_plugin(then_compile=True, force=True)
 
     def cancel_build(self):
+        """Cancel queued jobs, kill the running child, clear any trailing-rebuild flag."""
         if self.runner is None:
             return
         n = self.runner.cancel_pending()
@@ -807,6 +916,7 @@ class PluginBuilderExt:
         self._set_status('Cancelled')
 
     def clean_build(self):
+        """Cancel builds, rmtree PluginProjects/<name>/build, invalidate _last_configure_hash."""
         build_dir = os.path.join(self.abs_working_dir, 'build')
         if self.runner is not None:
             self.cancel_build()
@@ -817,6 +927,7 @@ class PluginBuilderExt:
         self._set_status('Clean')
 
     def run_tests(self):
+        """ctest --test-dir build --output-on-failure -LE perf (td_plugin_add_test targets; perf gates excluded)."""
         if not self._ensure_runner():
             return
         self._set_status('Testing…')
@@ -828,11 +939,79 @@ class PluginBuilderExt:
                 self._set_status(f'TESTS FAILED (exit {job.returncode})')
                 for line in job.output[-30:]:
                     print(line, end='')
-        self.runner.submit(self.core.BuildJob('test', ['ctest', '--test-dir', 'build', '--output-on-failure'],
+        # -LE perf: benchmark gates (td_plugin_add_bench ... GATE) are timing-sensitive and slow; they run
+        # on demand with `ctest -L perf` on an idle machine, not on every Run Tests pulse.
+        self.runner.submit(self.core.BuildJob('test', ['ctest', '--test-dir', 'build', '--output-on-failure', '-LE', 'perf'],
                                               self.abs_working_dir, label='ctest', on_done=on_done))
         self._schedule_poll()
 
+    def generate_parameters(self):
+        """Regenerate source/Parameters.h/.cpp from <project>/parameters.json (source/ParamGen.py).
+
+        Unchanged output files are not rewritten, so only a real spec change triggers the source watch
+        and a rebuild (with Compile On Update on).
+        """
+        spec = f"{self.working_dir}/parameters.json"
+        if not os.path.exists(spec):
+            self._set_error(f"No parameters.json in {self.working_dir} (see templates/RealtimeCHOP/project/parameters.json).")
+            return
+        try:
+            gen = _import_support_module('ParamGen', self.PluginBuilderDir)
+            h, c = gen.generate_files(spec, f"{self.working_dir}/source")
+        except Exception as e:  # noqa: BLE001
+            self._set_error(f"Generate Parameters failed: {e}")
+            return
+        self._log('Params', f"Generated {h} and {c} from parameters.json")
+        self._set_status('Parameters generated')
+
+    def bake_plugin(self):
+        """Create a standalone production node next to the PluginBuilder COMP ("Bake for Performance").
+
+        A show should not run the plugin inside the development COMP: mirrored parameters evaluate BIND
+        expressions, parameter-execute callbacks forward every change, folder DATs watch the source tree
+        and a run() loop polls the build runner. The baked node is a plain cplusplus<Family> op that loads
+        the deployed DLL with every parameter set to a constant (binds and expressions resolved to their
+        current values), wired to nothing - connect it where the plugin is needed.
+        """
+        loader = self.ownerComp.op('plugin_loader')
+        if loader is None or not getattr(loader, 'valid', True):
+            self._set_error('Bake: no plugin_loader in the PluginBuilder COMP.')
+            return
+        parent = self.ownerComp.parent()
+        name = f"{self.Pluginname}_baked"
+        try:
+            old = parent.op(name)
+            if old is not None:
+                old.destroy()
+            node = parent.create(type(loader), name)
+            node.nodeX, node.nodeY = self.ownerComp.nodeX + 200, self.ownerComp.nodeY - 150
+            dll = os.path.abspath(f"{project.folder}/{self.plugin_dir}/{self.Pluginname}.dll").replace('\\', '/')
+            node.par.plugin = dll
+            node.par.unloadplugin = False
+            node.cook(force=True)
+            copied = 0
+            for p in self._persisted_loader_pars(loader):
+                q = getattr(node.par, p.name, None)
+                if q is None or getattr(p, 'style', '') in ('Pulse', 'Header', 'Header2'):
+                    continue
+                try:
+                    q.val = p.eval()             # constants only: no bind, no expression
+                    copied += 1
+                except Exception:  # noqa: BLE001
+                    pass
+            node.cook(force=True)
+        except Exception as e:  # noqa: BLE001
+            self._set_error(f"Bake failed: {e}")
+            return
+        self._log('Bake', f"Created {node.path} ({copied} parameter value(s) copied as constants, DLL {dll})")
+        self._set_status(f'Baked → {node.name}')
+
     def RefreshDats(self):
+        """Force-cook file-watching DATs (folder_bin, folder_source, CMakeLists) + param sync.
+
+        Called on init (delayFrames=120) and from onPluginname after loading a project —
+        drives OnPluginUpdate / OnSourceUpdate / OnCMakeListsUpdate when files change.
+        """
         self._debug('Init', "Refreshing file-watching DATs...")
         for dat in (self.folder_binDat, self.folder_sourceDat, self.CMakeListsDat):
             if dat is not None:
@@ -844,9 +1023,16 @@ class PluginBuilderExt:
 
     # ========================================================================================== #
     #  CLEANUP                                                                                   #
+    #  clear_plugin_builder is the full reset (name cleared / user action); cancel_build and   #
+    #  clean_build only affect the build directory and queued jobs.                            #
     # ========================================================================================== #
 
     def clear_plugin_builder(self):
+        """Unload the plugin, destroy loader chain, drop mirrored pages, clear Pluginname.
+
+        Invoked when Pluginname is set to '' (onPluginname) or manually. Keeps the
+        builder / source / CMakeLists children (destroy_children preserves them).
+        """
         self._log('Cleanup', f"Clearing plugin builder (current: '{self.Pluginname}')")
         self.loader_op = self.ownerComp.op('plugin_loader')
         if self.loader_op is not None:
@@ -875,58 +1061,90 @@ class PluginBuilderExt:
 
     # ========================================================================================== #
     #  INSTALL                                                                                   #
+    #  Copies the deployed __Plugins__ tree to the user-wide Derivative/Plugins folder so the  #
+    #  plugin is available outside this .toe (safe_replace_file handles mapped DLLs).         #
     # ========================================================================================== #
 
     def install_plugin(self):
+        """Copy __Plugins__/<name>/ (minus *.old) to ~/Documents/Derivative/Plugins/<name>/.
+
+        Runs as an in-process BuildRunner job so a large runtime (oneMKL is ~520 MB) is compared and
+        copied off TouchDesigner's main thread; files whose size and mtime already match are skipped
+        without being read (safe_replace_file -> files_identical). An installed DLL that is currently
+        mapped is still replaced via the rename-in-place trick. Result and errors land in on_done.
+        """
         self._log('Install', f"Installing '{self.Pluginname}' from {self.plugin_dir}")
         if not os.path.exists(self.plugin_dir):
             self._set_error(f"Source folder {self.plugin_dir} does not exist.")
             return
-        install_dir = os.path.join(os.path.expanduser('~'), 'Documents', 'Derivative', 'Plugins')
-        os.makedirs(install_dir, exist_ok=True)
-        dest = os.path.join(install_dir, self.Pluginname)
-        os.makedirs(dest, exist_ok=True)
-        self.core.cleanup_old_files(dest)
-        copied = 0
-        for root, _dirs, files in os.walk(self.plugin_dir):
-            for fn in files:
-                if fn.endswith('.old') or '.old' in fn[-6:]:
-                    continue
-                src = os.path.join(root, fn)
-                rel = os.path.relpath(src, self.plugin_dir)
-                dst = os.path.join(dest, rel)
-                try:
-                    changed, note = self.core.safe_replace_file(src, dst)
-                    self._log('Install', f"  {rel}: {note}")
-                    copied += int(changed)
-                except Exception as e:  # noqa: BLE001
-                    self._set_error(f"Could not install {rel}: {e}")
-                    return
-        self._log('Install', f"INSTALLATION COMPLETE: {copied} file(s) updated in {dest}")
-        self._set_status(f'Installed → {dest}')
+        if not self._ensure_runner():
+            return
+        core = self.core
+        src_root = os.path.abspath(self.plugin_dir)
+        dest = os.path.join(os.path.expanduser('~'), 'Documents', 'Derivative', 'Plugins', self.Pluginname)
+
+        def work(job, emit):
+            os.makedirs(dest, exist_ok=True)
+            core.cleanup_old_files(dest)
+            copied, skipped = 0, 0
+            for root_dir, _dirs, files in os.walk(src_root):
+                for fn in files:
+                    if re.search(r'\.old\d*$', fn):
+                        continue
+                    src = os.path.join(root_dir, fn)
+                    rel = os.path.relpath(src, src_root)
+                    changed, note = core.safe_replace_file(src, os.path.join(dest, rel))
+                    if changed:
+                        copied += 1
+                        emit(f"[Install]   {rel}: {note}")
+                    else:
+                        skipped += 1
+            job.result = (copied, skipped)
+            return 0
+
+        def on_done(job):
+            if not job.ok:
+                self._set_error(f"Install failed: {job.error}")
+                self._set_status('Install FAILED')
+                return
+            copied, skipped = job.result
+            self._log('Install', f"INSTALLATION COMPLETE: {copied} file(s) updated, {skipped} unchanged in {dest}")
+            self._set_status(f'Installed → {dest}')
+
+        self._set_status('Installing…')
+        self.runner.submit(core.BuildJob('call', [], self.abs_working_dir, label=f'install {self.Pluginname}',
+                                         on_done=on_done, func=work))
+        self._schedule_poll()
 
     # ========================================================================================== #
     #  UI HELPERS                                                                                #
     # ========================================================================================== #
 
     def disable_create_pars(self):
+        """Lock create UI after create_plugin (skipped when settings [DevMode] is present)."""
         self.ownerComp.par.Createplugin.enable = False
         self.ownerComp.par.Pluginname.readOnly = True
         self.ownerComp.par.Plugintemplate.readOnly = True
         self.ownerComp.par.Createinputop.enable = False
 
     def EnableCreatePars(self):
+        """Unlock create UI (also called by dev/deploy.py:reset before export)."""
         self.ownerComp.par.Createplugin.enable = True
         self.ownerComp.par.Pluginname.readOnly = False
         self.ownerComp.par.Plugintemplate.readOnly = False
         self.ownerComp.par.Createinputop.enable = True
 
     def PostCreatePlugin(self):
+        """delayFrames=300 after create: force-cook CMakeLists DAT so the editor shows it."""
         if self.CMakeListsDat is not None:
             self.CMakeListsDat.cook(force=True)
 
     def file_locked(self, filepath):
-        """True if the file can't be opened for writing (a DLL mapped by a process denies write access)."""
+        """True if the file can't be opened for writing (a DLL mapped by a process denies write access).
+
+        Used by _do_copy_plugin to detect a still-writing linker output before hashing/copying.
+        Missing file -> False (nothing to lock yet).
+        """
         try:
             fd = os.open(filepath, os.O_RDWR)
             os.close(fd)
@@ -938,10 +1156,14 @@ class PluginBuilderExt:
 
     # ========================================================================================== #
     #  CUSTOM PARAMETER SYNC (page-preserving, signature-gated)                                  #
+    #  Mirrors the loader's custom parameters onto ownerComp with BIND expressions so the UI    #
+    #  lives on the PluginBuilder COMP while values drive plugin_loader.par.*.                  #
+    #  Signature (par_signature) gates full rebuilds; MirrorPages=false collapses onto 'Custom'.#
     # ========================================================================================== #
 
     @staticmethod
     def _get_custom_page(op, page_name):
+        """Find a custom page by name on op (None if op invalid / page missing)."""
         if op is None or not getattr(op, 'valid', True):
             return None
         for page in getattr(op, 'customPages', []):
@@ -950,6 +1172,7 @@ class PluginBuilderExt:
         return None
 
     def _mirrored_page_names(self):
+        """Page names this COMP mirrors into (stored as 'PB_mirror_pages'; always includes 'Custom')."""
         try:
             names = self.ownerComp.fetch('PB_mirror_pages', [])
         except Exception:  # noqa: BLE001
@@ -960,19 +1183,25 @@ class PluginBuilderExt:
         return names
 
     def _store_mirrored_pages(self, names):
+        """Persist mirrored page list under storage key 'PB_mirror_pages' (cleared by deploy.py)."""
         try:
             self.ownerComp.store('PB_mirror_pages', list(names))
         except Exception:  # noqa: BLE001
             pass
 
     def _own_page_names(self):
-        """Pages that belong to the builder UI itself (never mirrored into)."""
+        """Pages that belong to the builder UI itself (never mirrored into).
+
+        A plugin page that collides with an own-page name is renamed '<page> (Plugin)'
+        by _target_page_for so builder controls are never clobbered.
+        """
         mirrored = set(self._mirrored_page_names())
         return {p.name for p in self.ownerComp.customPages if p.name not in mirrored}
 
     @staticmethod
     def _copy_par_attributes(src_p, dst_p):
         # menus first so that a menu 'val' is accepted afterwards
+        # (menuNames/menuLabels must exist before assigning the current entry value)
         if hasattr(src_p, 'menuNames') and hasattr(dst_p, 'menuNames'):
             try:
                 dst_p.menuNames = list(src_p.menuNames)
@@ -987,7 +1216,11 @@ class PluginBuilderExt:
                     pass
 
     def _collect_loader_pars(self):
-        """Return list of (tuplet_name, page_name, style, components[list of Par], label, menu_names)."""
+        """Return list of (tuplet_name, page_name, style, components[list of Par], label, menu_names).
+
+        Skips BUILTIN_LOADER_PARS (reload-control / structural builtins) and non-custom
+        lowercase pars; only custom or Capitalized names are mirrored.
+        """
         groups, order = {}, []
         try:
             all_pars = self.loader_op.pars()
@@ -1014,6 +1247,7 @@ class PluginBuilderExt:
         return out
 
     def _target_page_for(self, page_name, own_pages):
+        """Resolve (and create if needed) the destination page for a loader parameter page."""
         if not self.mirror_pages:
             page_name = 'Custom'
         elif page_name in own_pages:
@@ -1024,7 +1258,11 @@ class PluginBuilderExt:
         return page
 
     def _create_mirror_par(self, page, tname, style, size, label):
-        """Create a parameter of the same style on the mirror page. Returns the (first) Par or None."""
+        """Create a parameter of the same style on the mirror page. Returns the (first) Par or None.
+
+        Falls back to appendStr when the style-specific append* method is missing or throws
+        (unknown style from a newer TD); logs [ParamSync] ERROR and returns None on total failure.
+        """
         method = getattr(page, f'append{style}', None)
         try:
             if method is None:
@@ -1042,6 +1280,7 @@ class PluginBuilderExt:
         return res[0] if isinstance(res, (list, tuple)) else res
 
     def _bind_components(self, src_comps, dst_first, is_pulse):
+        """Copy attributes then BIND each mirror component to loader.par.<name> (pulses stay unbound)."""
         dst_comps = list(getattr(dst_first, 'tuplet', None) or [dst_first])
         for src_p, dst_p in zip(src_comps, dst_comps):
             self._copy_par_attributes(src_p, dst_p)
@@ -1060,7 +1299,13 @@ class PluginBuilderExt:
                 pass
 
     def sync_custom_parameters(self, force_rebuild=False, verbose=False):
-        """Mirror the loader's custom parameters (pages preserved) onto ownerComp with BIND expressions."""
+        """Mirror the loader's custom parameters (pages preserved) onto ownerComp with BIND expressions.
+
+        Fast path: same par_signature -> only re-assert bindings (loader may have been
+        recreated). Rebuild path: compute target pages, destroy stale/wrong-style pars,
+        create/update the rest, drop empty mirrored pages (keep 'Custom'), store
+        PB_mirror_pages + _last_synced_sig. Force with the Refreshcustompars pulse.
+        """
         self.loader_op = self.ownerComp.op('plugin_loader')
         if self.loader_op is None or not getattr(self.loader_op, 'valid', True):
             return
@@ -1114,12 +1359,14 @@ class PluginBuilderExt:
                 existing = self._create_mirror_par(page, tname, style, len(comps), label)
                 if existing is None:
                     continue
-        else:
-            try:
-                existing.label = label
-            except Exception:  # noqa: BLE001
-                pass
-        self._bind_components(comps, existing, style in ('Pulse', 'Header', 'Header2'))
+            else:
+                try:
+                    existing.label = label
+                except Exception:  # noqa: BLE001
+                    pass
+            # Inside the loop: every mirrored parameter is bound, not only the last one (a for/else
+            # here used to bind a single parameter per rebuild until the next fast-path sync).
+            self._bind_components(comps, existing, style in ('Pulse', 'Header', 'Header2'))
 
         # drop mirrored pages that ended up empty (keep 'Custom' for compatibility)
         for page_name in list(mirrored_pages):
@@ -1143,12 +1390,19 @@ class PluginBuilderExt:
 
     # ========================================================================================== #
     #  PARAMETER CALLBACKS                                                                       #
+    #  Wired from the COMP's parameter execute DATs. Known handlers go through the dispatch     #
+    #  maps built in __init__; everything else is forwarded to the loader (mirror writes).      #
     # ========================================================================================== #
 
     def OnParValueChange(self, par, prev):
         if par.name in self.on_par_value_change_map:
             self.on_par_value_change_map[par.name](par.eval(), prev)
         elif self.loader_op is not None and getattr(self.loader_op, 'valid', True):
+            # A mirrored parameter is BIND-linked to the loader, so the bind already carried the value;
+            # writing it again would set the loader parameter twice (two parameter-change cooks).
+            pm = _par_mode()
+            if pm is not None and getattr(par, 'mode', None) == getattr(pm, 'BIND', object()):
+                return
             loader_par = getattr(self.loader_op.par, par.name, None)
             if loader_par is not None:
                 try:
@@ -1168,11 +1422,15 @@ class PluginBuilderExt:
                     pass
 
     def onOutputto(self, value, prev):
+        """Output routing changed: tear down and restart the build runner with the new sink."""
         self._log('Runner', f"Output mode changed: '{prev}' → '{value}', restarting build runner...")
         self.close_subprocess()
         self.start_subprocess()
 
     def onPluginname(self, value, prev):
+        """Pluginname changed: '' clears the builder; existing manifest loads the project;
+        otherwise just refresh DATs. Failed manifest reads must NOT unload a healthy plugin
+        (see the long comment — _ensure_loader_live repairs that intermittent case)."""
         if value == '':
             self._log('Init', f"Plugin name cleared (was '{prev}'), clearing builder...")
             self.clear_plugin_builder()
@@ -1211,10 +1469,16 @@ class PluginBuilderExt:
 
     # ========================================================================================== #
     #  FILE CHANGE CALLBACKS                                                                     #
+    #  Driven by folder DAT cooks (RefreshDats / file watches): build/bin -> copy, source ->   #
+    #  compile, CMakeLists -> reconfigure. All debounced or hash-gated.                        #
     # ========================================================================================== #
 
     def OnPluginUpdate(self):
-        """folder_bin DAT callback: something changed in build/bin — schedule a hash-gated copy."""
+        """folder_bin DAT callback: something changed in build/bin — schedule a hash-gated copy.
+
+        No-op until build_path exists (first configure may not have linked yet).
+        Cross-ref: _schedule_copy -> _do_copy_plugin -> _reload_loader_fresh.
+        """
         if self.loader_op is None or self.Pluginname == '':
             return
         if not os.path.exists(self.build_path):
@@ -1223,6 +1487,7 @@ class PluginBuilderExt:
         self._schedule_copy()
 
     def _schedule_copy(self, delay_frames=10):
+        """Debounce DLL copies: kill prior 'copy_dll' runs, record mtime, schedule _do_copy_plugin."""
         for r in runs:
             if r.group == 'copy_dll':
                 r.kill()
@@ -1235,13 +1500,22 @@ class PluginBuilderExt:
         run("args[0].ext.PluginBuilderExt._do_copy_plugin()", self.ownerComp, group='copy_dll', delayFrames=delay_frames)
 
     def _runtime_dlls_in_bin(self):
+        """Runtime DLLs to stage next to the plugin (FFTW, OpenCV, ...), excluding the plugin itself.
+
+        Preferred source: build/<name>_runtime_dlls.txt, written by TDPlugin.cmake's
+        td_plugin_add_runtime_dll - exactly the DLLs the project declared. Without it (projects
+        configured by an older TDPlugin.cmake) every *.dll in build/bin/<Config>/ is staged, which also
+        sweeps up anything dropped there by hand (e.g. a 520 MB oneMKL runtime copied in for a bench).
+        """
         bin_dir = self.CurrentBinDir
-        out = []
-        if os.path.isdir(bin_dir):
-            for fn in os.listdir(bin_dir):
-                if fn.lower().endswith('.dll') and fn != f'{self.Pluginname}.dll':
-                    out.append(os.path.join(bin_dir, fn))
-        return out
+        if not os.path.isdir(bin_dir):
+            return []
+        declared = self.core.read_runtime_dll_manifest(os.path.join(self.working_dir, 'build'), self.Pluginname)
+        if declared is not None:
+            return [os.path.join(bin_dir, fn) for fn in declared
+                    if fn != f'{self.Pluginname}.dll' and os.path.exists(os.path.join(bin_dir, fn))]
+        return [os.path.join(bin_dir, fn) for fn in os.listdir(bin_dir)
+                if fn.lower().endswith('.dll') and fn != f'{self.Pluginname}.dll']
 
     # ---------------- loader reload with fresh parameter definitions ----------------------------- #
     #
@@ -1251,9 +1525,15 @@ class PluginBuilderExt:
     # (which is what a TouchDesigner restart does). So a reload first unloads the plugin, checks
     # whether that removed the custom parameters, and if TouchDesigner kept them recreates the loader
     # node (same name, same wires). Values / expressions / bindings are snapshotted and restored.
+    #
+    # v2.1.1: this path was added after Plugin_FFT's Planner=Patient menu change did not appear
+    # on an already-open loader. Helpers are pure and unit-tested (LoaderParPersistenceTests).
 
     def _custom_loader_pars(self, loader=None):
-        """Custom parameters only (used for the menu-diff log and COMP mirroring)."""
+        """Custom parameters only (used for the menu-diff log and COMP mirroring).
+
+        Filters out BUILTIN_LOADER_PARS; keeps isCustom or Capitalized names only.
+        """
         loader = loader or self.loader_op
         out = []
         try:
@@ -1271,7 +1551,10 @@ class PluginBuilderExt:
     def _persisted_loader_pars(self, loader=None):
         """Pars whose value should survive a fresh-node reload: every custom parameter plus the
         built-in value parameters (timeslice, scope, outputresolution, resolutionw/h, pixelformat,
-        ...). Excludes the reload-control/structural pars (handled by is_persisted_par)."""
+        ...). Excludes the reload-control/structural pars (handled by is_persisted_par).
+
+        Pure predicate: Core.is_persisted_par(name, is_custom, style).
+        """
         loader = loader or self.loader_op
         out = []
         try:
@@ -1292,7 +1575,9 @@ class PluginBuilderExt:
     def _snapshot_loader_values(self, loader=None):
         """[(name, mode_name, value)] for every persisted loader parameter (pulses skipped).
         Built-in pars are included so a fresh-node reload no longer resets timeslice / output
-        resolution / pixel format / etc."""
+        resolution / pixel format / etc. Classification is pure: Core.is_persisted_par /
+        snapshot_par / normalize_par_mode (unit-tested in LoaderParPersistenceTests).
+        """
         par_mode = _par_mode()
         snap = []
         for p in self._persisted_loader_pars(loader):
@@ -1312,7 +1597,12 @@ class PluginBuilderExt:
         return snap
 
     def _restore_loader_values(self, snapshot, target=None):
-        """target defaults to the current loader_op (the freshly loaded node)."""
+        """target defaults to the current loader_op (the freshly loaded node).
+
+        Each record goes through Core.restore_action (apply_value / apply_expr /
+        apply_bind / skip); vanished menu entries are skipped with a reason, not errors.
+        Returns (restored_count, skipped_list).
+        """
         target = target or self.loader_op
         par_mode = _par_mode()
         restored, skipped = 0, []
@@ -1347,7 +1637,12 @@ class PluginBuilderExt:
     def _recreate_loader_node(self):
         """Replace the loader op by a fresh node of the same type, keeping the 'plugin_loader' name,
         position and wires. Tolerates a stale 'plugin_loader_fresh' left behind by a crashed prior
-        reload (clears it first so create() doesn't silently suffix the name)."""
+        reload (clears it first so create() doesn't silently suffix the name).
+
+        Only called from _reload_loader_fresh when TD kept the old parameter objects across
+        unload — a fresh node is the only way setupParameters() re-runs with new definitions
+        (v2.1.1 hot-reload fix, discovered via Plugin_FFT's Planner=Patient menu).
+        """
         old = self.loader_op
         if old is None:
             return None
@@ -1395,6 +1690,9 @@ class PluginBuilderExt:
         full and one whose popup comes up empty with no other symptom: the plugin has to actually be
         loaded (unloadplugin off), and the node has to be cooked every frame (viewer on - see
         create_plugin_loader for why that pull is the only kick-start this host has).
+
+        Called from onPluginname (failed-manifest path) and at the end of every _reload_loader_fresh
+        branch including rollback.
         """
         if self.loader_op is None or not getattr(self.loader_op, 'valid', True):
             return
@@ -1415,7 +1713,12 @@ class PluginBuilderExt:
     def _reload_loader_fresh(self, plugin_path):
         """Unload -> (recreate node if needed) -> load plugin_path, restoring the parameter values.
         Hardened: re-resolves the loader defensively, snapshots the previous DLL path so a failed
-        map can be rolled back, and guards each non-recoverable step with try/except + _set_error."""
+        map can be rolled back, and guards each non-recoverable step with try/except + _set_error.
+
+        Steps (numbered in-body): 1 unload+cook, 2 recreate if custom pars survived,
+        3 map new DLL, 4 reinit pulse, 5 restore snapshot + log parameter_definition_diff.
+        Every path ends in _ensure_loader_live().
+        """
         # Re-resolve in case the COMP was edited underneath us between schedule and cook.
         self.loader_op = self.ownerComp.op('plugin_loader')
         if self.loader_op is None or not getattr(self.loader_op, 'valid', True):
@@ -1490,10 +1793,13 @@ class PluginBuilderExt:
         """
         Hot-swap the built DLL into __Plugins__/ with the rename-in-place trick and reload the loader.
 
-        The DLL file is replaced with the rename trick (a mapped DLL can be renamed on Windows, so the old
-        image stays valid until the loader lets go of it); the loader is then reloaded with fresh parameter
-        definitions by _reload_loader_fresh(). If the build output is still being written (linker lock) the
-        copy is retried a few frames later.
+        Main thread (cheap): lock / still-being-written check on the build output, then submit the
+        staging as an in-process BuildRunner job. Runner thread: hash-gate, rename-in-place copy of the
+        plugin DLL and its declared runtime DLLs (safe_replace_file, size+mtime fast path first).
+        Main thread again, in on_done: _reload_loader_fresh() - the only step that must touch
+        TouchDesigner. Nothing that reads or hashes files runs on the main thread any more, so a reload
+        does not drop frames even with hundreds of MB of runtime DLLs next to the plugin.
+        force=True (the Reloadplugin pulse) reloads even when the DLL hash is unchanged.
         """
         if self.loader_op is None or self.Pluginname == '':
             return
@@ -1503,7 +1809,7 @@ class PluginBuilderExt:
             self._log('Build→Copy', f"ERROR: Build output {build_path} does not exist.")
             return
 
-        # linker still writing? (size/mtime moved since scheduling or file not openable)
+        # linker still writing? (mtime moved since scheduling or file not openable)
         try:
             mtime = os.path.getmtime(build_path)
         except OSError:
@@ -1519,48 +1825,71 @@ class PluginBuilderExt:
             self.open_attempts = 0
             return
         self.open_attempts = 0
-
-        try:
-            new_hash = self.core.file_sha256(build_path)
-        except OSError as e:
-            self._set_error(f"cannot hash {build_path}: {e}")
-            return
-        if not force and new_hash == self._loaded_dll_hash and os.path.exists(plugin_path):
-            self._debug('Build→Copy', 'DLL unchanged — reload skipped')
+        if not self._ensure_runner():
             return
 
-        os.makedirs(self.plugin_dir, exist_ok=True)
-        self.core.cleanup_old_files(self.plugin_dir)
-        try:
-            changed, note = self.core.safe_replace_file(build_path, plugin_path)
-            for dll in self._runtime_dlls_in_bin():
-                dst = os.path.join(self.plugin_dir, os.path.basename(dll))
-                _c, n = self.core.safe_replace_file(dll, dst)
-                self._debug('Build→Copy', f"  runtime {os.path.basename(dll)}: {n}")
-        except PermissionError as e:
-            if self.open_attempts < 20:
-                self.open_attempts += 1
-                self._debug('Build→Copy', f"destination locked ({e}); retrying (attempt {self.open_attempts}/20)")
-                run("args[0].ext.PluginBuilderExt._do_copy_plugin()", self.ownerComp, group='copy_dll', delayFrames=5)
+        core = self.core
+        plugin_dir = self.plugin_dir
+        runtime = self._runtime_dlls_in_bin()
+        loaded_hash = self._loaded_dll_hash
+
+        def stage(job, emit):
+            # Runner thread: files only, no TouchDesigner API.
+            t0 = time.perf_counter()
+            new_hash = core.file_sha256(build_path)
+            if not force and new_hash == loaded_hash and os.path.exists(plugin_path):
+                job.result = {'skipped': True, 'hash': new_hash}
+                return 0
+            os.makedirs(plugin_dir, exist_ok=True)
+            core.cleanup_old_files(plugin_dir)
+            changed, note = core.safe_replace_file(build_path, plugin_path)
+            notes = []
+            for dll in runtime:
+                dst = os.path.join(plugin_dir, os.path.basename(dll))
+                _c, n = core.safe_replace_file(dll, dst)
+                notes.append(f"{os.path.basename(dll)}: {n}")
+            job.result = {'skipped': False, 'hash': new_hash, 'note': note, 'runtime': notes,
+                          'size': os.path.getsize(plugin_path), 'ms': (time.perf_counter() - t0) * 1000.0}
+            return 0
+
+        def on_done(job):
+            # Main thread.
+            if job.cancelled:
                 return
-            self._set_error(f"Could not replace {plugin_path}: {e}")
+            if not job.ok:
+                err = job.error
+                if isinstance(err, PermissionError) and self.open_attempts < 20:
+                    self.open_attempts += 1
+                    self._debug('Build→Copy', f"destination locked ({err}); retrying (attempt {self.open_attempts}/20)")
+                    run("args[0].ext.PluginBuilderExt._do_copy_plugin()", self.ownerComp, group='copy_dll', delayFrames=5)
+                    return
+                self.open_attempts = 0
+                self._set_error(f"Copy failed: {err}")
+                return
             self.open_attempts = 0
-            return
-        except Exception as e:  # noqa: BLE001
-            self._set_error(f"Copy failed: {e}")
-            return
+            r = job.result or {}
+            if r.get('skipped'):
+                self._debug('Build→Copy', 'DLL unchanged — reload skipped')
+                return
+            for n in r.get('runtime', []):
+                self._debug('Build→Copy', f"  runtime {n}")
+            self._log('Build→Copy', f"{os.path.basename(plugin_path)}: {r.get('note')} ({r.get('size')} bytes, "
+                                    f"staged off-thread in {r.get('ms', 0.0):.1f} ms)")
+            self._reload_loader_fresh(plugin_path)
+            self._loaded_dll_hash = r.get('hash')
+            try:
+                self.ownerComp.par.Loadeddll = f"{os.path.basename(plugin_path)} @ {time.strftime('%H:%M:%S')}"
+            except Exception:  # noqa: BLE001
+                pass
+            self._log('Build→Copy', f"Plugin reloaded from {plugin_path}")
+            run("args[0].ext.PluginBuilderExt.sync_custom_parameters(verbose=True)", self.ownerComp, delayFrames=15)
 
-        self._log('Build→Copy', f"{os.path.basename(plugin_path)}: {note} ({os.path.getsize(plugin_path)} bytes)")
-        self._reload_loader_fresh(plugin_path)
-        self._loaded_dll_hash = new_hash
-        try:
-            self.ownerComp.par.Loadeddll = f"{os.path.basename(plugin_path)} @ {time.strftime('%H:%M:%S')}"
-        except Exception:  # noqa: BLE001
-            pass
-        self._log('Build→Copy', f"Plugin reloaded from {plugin_path}")
-        run("args[0].ext.PluginBuilderExt.sync_custom_parameters(verbose=True)", self.ownerComp, delayFrames=15)
+        self.runner.submit(core.BuildJob('call', [], self.abs_working_dir, label=f'stage {self.Pluginname}',
+                                         on_done=on_done, func=stage))
+        self._schedule_poll()
 
     def OnSourceUpdate(self):
+        """folder_source DAT callback: a .cpp/.h changed — recompile when Compile On Update is on."""
         if not self.CompileOnUpdate:
             self._debug('Source', 'source changed but Compile On Update is off')
             return
@@ -1568,6 +1897,7 @@ class PluginBuilderExt:
         self.compile_plugin()
 
     def OnCMakeListsUpdate(self):
+        """CMakeLists DAT callback: force reconfigure (and compile when Compile On Update is on)."""
         if not os.path.exists(self.CMakeListsPath):
             self._log('CMake', f"CMakeLists.txt not found at {self.CMakeListsPath}")
             return
@@ -1576,9 +1906,17 @@ class PluginBuilderExt:
 
     # ========================================================================================== #
     #  BUILD RUNNER MANAGEMENT                                                                   #
+    #  One BuildRunner per extension; env built by _env_factory (vcvarsall + PLUGINBUILDER_   #
+    #  BUILD=1). Events drained on the main thread via the 'pb_poll' run() loop.               #
     # ========================================================================================== #
 
     def _env_factory(self):
+        """Build the MSVC environment for BuildRunner: vcvarsall + ninja/cmake PATH + build env.
+
+        Sets PLUGINBUILDER_BUILD=1 (so TDPlugin.cmake skips POST_BUILD deploy),
+        PLUGIN_BUILDER_DIR (CMake include path), and TD_SAMPLES_DIR when available.
+        Called on the runner's worker thread by BuildRunner._worker.
+        """
         extra_path = [self.toolchain.get('ninja_dir', ''), self.toolchain.get('cmake_dir', '')]
         extra_env = {'PLUGINBUILDER_BUILD': '1', 'PLUGIN_BUILDER_DIR': self.PluginBuilderDir}
         samples = self.TDSamplesDir
@@ -1588,6 +1926,7 @@ class PluginBuilderExt:
                                         extra_path_dirs=extra_path, extra_env=extra_env)
 
     def _ensure_runner(self):
+        """Start BuildRunner if needed (lazy). Returns False when the toolchain is invalid."""
         if self.runner is not None and self.runner.alive:
             return True
         if not self.PathsValid:
@@ -1602,13 +1941,17 @@ class PluginBuilderExt:
         return True
 
     def start_subprocess(self):
-        """Legacy name: start the build runner (lazy; safe to call repeatedly)."""
+        """Legacy name: start the build runner (lazy; safe to call repeatedly).
+
+        No-op (False) until the working dir exists — onPluginname calls this when loading.
+        """
         if not os.path.exists(self.abs_working_dir):
             self._debug('Runner', f"not started — working dir does not exist: {self.abs_working_dir}")
             return False
         return self._ensure_runner()
 
     def close_subprocess(self):
+        """Shut down the BuildRunner (legacy name kept for parexec/execute DATs)."""
         if self.runner is not None:
             self._log('Runner', "Shutting down build runner...")
             try:
@@ -1619,26 +1962,40 @@ class PluginBuilderExt:
             self.process = None
 
     def SendCommand(self, command):
-        """Run an arbitrary shell command inside the MSVC environment (legacy API)."""
+        """Run an arbitrary shell command inside the MSVC environment (legacy API).
+
+        Wrapped as BuildJob('custom', ['cmd.exe','/c',command]) — not evaluated by a shell
+        beyond cmd.exe itself; requires _ensure_runner().
+        """
         if not self._ensure_runner():
             raise RuntimeError("Build runner could not be started.")
         self.runner.submit(self.core.BuildJob('custom', ['cmd.exe', '/c', command], self.abs_working_dir, label=command))
         self._schedule_poll()
 
     def _schedule_poll(self):
+        """(Re)arm the one-frame _poll run() loop under group 'pb_poll' (kills any prior arm)."""
         for r in runs:
             if r.group == 'pb_poll':
                 r.kill()
         run("args[0].ext.PluginBuilderExt._poll()", self.ownerComp, group='pb_poll', delayFrames=1)
 
     def _poll(self):
-        """Drain runner events on the main thread; reschedules itself while the runner is alive."""
+        """Drain runner events on the main thread; reschedules itself only while there is work.
+
+        Output lines of one frame are joined into a single print, capped at 200 lines
+        (Core.coalesce_output) - textport printing is not free, and a full build can emit hundreds of
+        lines at once. The loop re-arms every frame while a job runs or events arrived, every 15 frames
+        while the MSVC environment is still being captured, and stops when the runner is idle; every
+        submit path calls _schedule_poll() again.
+        """
         if self.runner is None:
             return
-        for ev in self.runner.poll():
+        lines = []
+        events = self.runner.poll()
+        for ev in events:
             kind = ev[0]
             if kind == 'line':
-                print(ev[2], end='')
+                lines.append(ev[2])
             elif kind == 'env':
                 ok, msg = ev[1], ev[2]
                 if ok:
@@ -1648,14 +2005,22 @@ class PluginBuilderExt:
                     self._set_status('Toolchain error')
             elif kind == 'start':
                 self._debug('Runner', f"▶ {ev[1].label}")
+        if lines:
+            text, _dropped = self.core.coalesce_output(lines, 200)
+            print(text, end='')
         if self.runner is not None and self.runner.alive:
-            delay = 1 if self.runner.busy else 15
-            run("args[0].ext.PluginBuilderExt._poll()", self.ownerComp, group='pb_poll', delayFrames=delay)
+            if self.runner.busy or events:
+                run("args[0].ext.PluginBuilderExt._poll()", self.ownerComp, group='pb_poll', delayFrames=1)
+            elif not self.runner.env_ready:
+                run("args[0].ext.PluginBuilderExt._poll()", self.ownerComp, group='pb_poll', delayFrames=15)
+            # else: idle - no Python runs per frame until the next submit re-arms the loop
 
     def CheckAndPrintOutput(self):
+        """Legacy alias for one _poll() drain (parexec-friendly name)."""
         self._poll()
 
     def GetOutput(self):
+        """Pop queued stdout lines from the runner (does not run on_done side effects beyond poll)."""
         lines = []
         if self.runner is not None:
             for ev in self.runner.poll():
@@ -1664,5 +2029,6 @@ class PluginBuilderExt:
         return lines
 
     def PrintOutput(self):
+        """Print everything GetOutput() would return."""
         for line in self.GetOutput():
             print(line, end='')

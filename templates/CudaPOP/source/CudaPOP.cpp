@@ -23,6 +23,8 @@
 // you are creating
 extern "C"
 {
+// Called once when the DLL is loaded: API version, operator metadata (filled in
+// when the plugin is generated) and input counts (exactly one input here).
 DLLEXPORT
 void
 FillPOPPluginInfo(POP_PluginInfo *info)
@@ -54,6 +56,7 @@ FillPOPPluginInfo(POP_PluginInfo *info)
 	info->customOPInfo.opHelpURL->setString("#__OP_HELPURL__#");
 }
 
+// The CudaPOP constructor creates the node's CUDA stream.
 DLLEXPORT
 POP_CPlusPlusBase*
 CreatePOPInstance(const OP_NodeInfo* info, POP_Context *context)
@@ -64,6 +67,7 @@ CreatePOPInstance(const OP_NodeInfo* info, POP_Context *context)
 	return new CudaPOP(info, context);
 }
 
+// The CudaPOP destructor destroys the CUDA stream.
 DLLEXPORT
 void
 DestroyPOPInstance(POP_CPlusPlusBase* instance, POP_Context *context)
@@ -83,11 +87,15 @@ DestroyPOPInstance(POP_CPlusPlusBase* instance, POP_Context *context)
 
 CudaPOP::CudaPOP(const OP_NodeInfo* info, POP_Context *context) :
 	myNodeInfo(info), myExecuteCount(0),
-	myError(nullptr),
 	myStream(0),
 	myContext(context)
 {
-	cudaStreamCreate(&myStream);
+	// Non-blocking: work on this stream does not implicitly synchronize with the
+	// legacy default stream. TouchDesigner syncs with it through the stream
+	// passed in POP_GetBufferInfo / POP_SetBufferInfo.
+	// If creation fails myStream stays 0 (the default stream) and still works.
+	if (cudaStreamCreateWithFlags(&myStream, cudaStreamNonBlocking) != cudaSuccess)
+		myStream = 0;
 }
 
 CudaPOP::~CudaPOP()
@@ -139,10 +147,13 @@ CudaPOP::copyAllAttributes(POP_AttributeClass c, std::vector<std::pair<std::stri
 }
 
 
+// Cook. Gets every attribute of the input as CUDA buffers, shifts P.z with the
+// kernel in kernel.cu (between beginCUDAOperations() and endCUDAOperations()),
+// then passes all buffers through to the output. Errors go to getErrorString().
 void
 CudaPOP::execute(POP_Output* output, const OP_Inputs* inputs, void* reserved)
 {
-	myError = nullptr;
+	myError.clear();
 	myExecuteCount++;
 
 	if (inputs->getNumInputs() > 0)
@@ -178,7 +189,11 @@ CudaPOP::execute(POP_Output* output, const OP_Inputs* inputs, void* reserved)
 		POP_GetBufferInfo indexGInfo;
 		indexGInfo.location = POP_BufferLocation::CUDA;
 		indexGInfo.stream = myStream;
-		OP_SmartRef<POP_Buffer> indexBuf = input->getIndexBuffer(nullptr)->getBuffer(indexGInfo, nullptr);
+		// The input may have no index buffer: check before dereferencing.
+		const POP_IndexBuffer* inputIndex = input->getIndexBuffer(nullptr);
+		OP_SmartRef<POP_Buffer> indexBuf;
+		if (inputIndex)
+			indexBuf = inputIndex->getBuffer(indexGInfo, nullptr);
 
 		OP_SmartRef<POP_Buffer> posBuf;
 		for (auto& attr : pointAttrs)
@@ -201,29 +216,47 @@ CudaPOP::execute(POP_Output* output, const OP_Inputs* inputs, void* reserved)
 			POP_BufferInfo createInfo;
 			createInfo = posBuf->info;
 			OP_SmartRef<POP_Buffer> newPosBuf = myContext->createBuffer(createInfo, nullptr);
-			newDst = newPosBuf->getData(nullptr);
+			if (newPosBuf)
+				newDst = newPosBuf->getData(nullptr);
 #endif
 
-			// Make sure all CUDA operations are done between these begin/end calls
-			myContext->beginCUDAOperations(nullptr);
-
-			// If newDst is nullptr, it will apply the operation to the posBuf data in-place.
-			// Otherwise it will read from posBuf and write out ot newDst
-			shiftZPosition(posBuf, newDst, infoBufs.pointInfo, infoBufs.maxInfo, myStream);
-
-			myContext->endCUDAOperations(nullptr);
-
-#ifdef COPY_EXAMPLE
-			// Replace the buffer with the new one we created
-			for (auto& attr : pointAttrs)
+			// Make sure all CUDA operations are done between these begin/end calls.
+			// If begin fails no CUDA work may be issued: the input passes through unchanged.
+			if (myContext->beginCUDAOperations(nullptr))
 			{
-				if (attr.second == posBuf)
+				// If newDst is nullptr, it will apply the operation to the posBuf data in-place.
+				// Otherwise it will read from posBuf and write out ot newDst
+				cudaError_t status = shiftZPosition(posBuf, newDst, infoBufs.pointInfo, infoBufs.maxInfo, myStream);
+
+				myContext->endCUDAOperations(nullptr);
+
+				if (status != cudaSuccess)
 				{
-					attr.second = std::move(newPosBuf);
-					break;
+					myError = "CUDA error: ";
+					myError += cudaGetErrorString(status);
 				}
-			}
+#ifdef COPY_EXAMPLE
+				else if (newDst)
+				{
+					// Replace the buffer with the new one we created.
+					// Match by name: OP_SmartRef has no operator==, so the official
+					// sample's 'attr.second == posBuf' compared two bools (always
+					// true) and replaced the first point attribute, not P.
+					for (auto& attr : pointAttrs)
+					{
+						if (attr.first == "P")
+						{
+							attr.second = std::move(newPosBuf);
+							break;
+						}
+					}
+				}
 #endif
+			}
+			else
+			{
+				myError = "beginCUDAOperations() failed.";
+			}
 		}
 
 		// How assign the outputs.
@@ -235,7 +268,8 @@ CudaPOP::execute(POP_Output* output, const OP_Inputs* inputs, void* reserved)
 		copyAllAttributes(POP_AttributeClass::Point, pointAttrs, sinfo, input, output);
 		copyAllAttributes(POP_AttributeClass::Vertex, vertAttrs, sinfo, input, output);
 		copyAllAttributes(POP_AttributeClass::Primitive, primAttrs, sinfo, input, output);
-		output->setIndexBuffer(&indexBuf, input->getIndexBuffer(nullptr)->info, sinfo, nullptr);
+		if (inputIndex && indexBuf)
+			output->setIndexBuffer(&indexBuf, inputIndex->info, sinfo, nullptr);
 		output->setInfoBuffers(&infoBufs, sinfo, nullptr);
 	}
 
@@ -306,7 +340,8 @@ CudaPOP::getInfoDATEntries(int32_t index,
 void
 CudaPOP::getErrorString(OP_String *error, void* reserved)
 {
-	error->setString(myError);
+	if (!myError.empty())
+		error->setString(myError.c_str());
 }
 
 void

@@ -2,6 +2,25 @@
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+> **Sibling project:** [`../Plugin_FFT`](../Plugin_FFT) is the production consumer of this builder
+> (FFT analysis CHOP). Cross-repo verification:
+> `python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT`. Several fixes below (notably
+> 2.1.1's parameter-definition refresh and the `td_plugin_use_fftw3` `VERSION`/`DYNAMIC` flags)
+> were driven by needs discovered while building and hot-reloading that plugin.
+
+---
+
+## [Unreleased] - 2026-09-22
+
+### Documentation
+- **Docs refresh pass.** README and AUDIT brought up to date with the code as of 2.1.4:
+  test count corrected **23 → 29** (the 2.1.3 suite), AUDIT dated and annotated with the
+  2.1.1–2.1.4 delta, source-map table added to README, and a *Relationship to Plugin_FFT*
+  section added to both README and a new AUDIT §6 documenting the cross-repo contract
+  (CMake module, manifest, `__Plugins__/` layout, `ci.py --project`, hot-reload feedback loop).
+- **Code comments.** Extensive explanatory comments added throughout `source/`, `dev/`,
+  `tests/`, `cmake/` and `templates/` (no logic changes).
+
 ---
 
 ## [2.1.4] - 2026-09-14

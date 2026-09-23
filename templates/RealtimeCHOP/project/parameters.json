@@ -1,0 +1,26 @@
+{
+  "namespace": "Parameters",
+  "pages": [
+    {
+      "name": "Meter",
+      "pars": [
+        { "name": "Mode", "label": "Level Mode", "type": "menu", "enum": "Mode", "field": "mode",
+          "items": [["Rms", "RMS"], ["Peak", "Peak"]], "default": "Rms" },
+        { "name": "Gain", "label": "Gain", "type": "float", "default": 1.0, "min": 0.0, "max": 4.0,
+          "clamp": [0.0, 1000.0], "field": "gain" },
+        { "name": "Smooth", "label": "Smoothing", "type": "toggle", "default": true, "field": "smooth" },
+        { "name": "Attackms", "label": "Attack ms", "type": "float", "default": 10.0, "min": 0.0, "max": 500.0,
+          "clamp": [0.0, 60000.0], "field": "attackMs", "enable_if": "v.smooth" },
+        { "name": "Releasems", "label": "Release ms", "type": "float", "default": 250.0, "min": 0.0, "max": 2000.0,
+          "clamp": [0.0, 60000.0], "field": "releaseMs", "enable_if": "v.smooth" },
+        { "name": "Reset", "label": "Reset", "type": "pulse" }
+      ]
+    },
+    {
+      "name": "Performance",
+      "pars": [
+        { "name": "Async", "label": "Worker Thread", "type": "toggle", "default": false, "field": "async" }
+      ]
+    }
+  ]
+}

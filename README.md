@@ -1,5 +1,14 @@
 # PluginBuilder V2
 
+> **Paired project:** this repository is the *build system*; the sibling
+> [`../Plugin_FFT`](../Plugin_FFT) repository is a full *consumer* of it — a real-time FFT analysis
+> CHOP that is configured, compiled, hot-reloaded and tested through PluginBuilder. Whenever a
+> contract below (CMake functions, `plugin.json`, loader chain, `__Plugins__/` layout) changes,
+> Plugin_FFT is the integration case that exercises it: `python dev/ci.py --project
+> ../Plugin_FFT/PluginProjects/FFT` is the cross-repo smoke test, and several hot-reload fixes in
+> the changelog (e.g. 2.1.1's parameter-definition refresh) were discovered while iterating on the
+> FFT plugin. See *Relationship to Plugin_FFT* at the end of this file.
+
 PluginBuilder is a development tool for building, hot-reloading and installing C++ custom operators
 (CHOP / TOP / DAT / SOP / **POP**) for TouchDesigner, from inside TouchDesigner. It drives CMake + Ninja
 through a persistent MSVC environment, recompiles on every source save (usually well under a second),
@@ -78,9 +87,9 @@ See `cmake/TDPlugin.cmake` for the full list and the `TD_PLUGIN_WARNINGS` / `TD_
 ## Development
 
 ```
-python -m unittest discover -s tests -v      # 23 headless tests for source/PluginBuilderCore.py
+python -m unittest discover -s tests -v      # 29 headless tests for source/PluginBuilderCore.py
 python dev/ci.py --all                       # + scaffold every template and build the non-CUDA ones
-python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT
+python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT   # cross-repo: configure + build the sibling FFT CHOP
 python dev/sync_templates.py                 # resync SDK headers + templates from the installed TouchDesigner
 ```
 `source/PluginBuilderCore.py` holds all TouchDesigner-independent logic (naming, settings, toolchain
@@ -89,6 +98,41 @@ discovery, templates, manifests, diagnostics parsing, the build runner, hot-swap
 `PluginBuilderDir/source`, so the `.tox` always runs the current code. `dev/deploy.py` (run inside `dev/dev.toe`)
 re-exports `PluginBuilder.tox`.
 
+### Source map (where to look first)
+
+| File / folder | What lives there |
+|---|---|
+| `source/PluginBuilderCore.py` | Pure Python: naming/validation, settings, template loading + rendering, CMake text assembly, `plugin.json` manifest, MSVC/toolchain discovery, `safe_replace_file` / lock detection, SDK-version checks, diagnostic parsing, `BuildRunner` job queue, parameter-persistence classification |
+| `source/PluginBuilderExt.py` | TouchDesigner adapter: status page, path properties, create/install plugin, loader chain, build orchestration, hash-gated hot reload, fresh-loader recreation, parameter mirroring with BIND expressions |
+| `source/CMakeBlocks.py` | Emits the ~15-line generated `CMakeLists.txt` (header comment + `include(TDPlugin.cmake)` + `td_add_plugin`) |
+| `cmake/TDPlugin.cmake` | The shared CMake module every generated project includes: `td_add_plugin`, `td_plugin_use_*` (fftw3 / cuda / python / opencv), `td_plugin_optimize`, runtime-DLL staging, test/bench targets |
+| `cmake/TDDeploy.cmake` | Rename-in-place post-build deploy for *standalone* (non-PluginBuilder) builds — same trick the extension uses at runtime |
+| `templates/*/` | Eight scaffolds (BasicCHOP, CHOPWithPythonClass, BasicDAT, CPUMemoryTOP, CudaTOP, SimpleShapesPOP, CudaPOP, SimpleShapesSOP); each is `template.json` + `source/` with `#__OP_*__#` placeholders |
+| `include/` | Vendored Derivative C++ SDK headers (API 10) + `sdk_versions.json` |
+| `tests/test_core.py` | 29 unittest methods against Core only (Ext is TD-dependent and covered by `ci.py`) |
+| `dev/` | `ci.py` (headless scaffold+build), `sync_templates.py` (re-import SDK + templates from TD), `deploy.py` (re-export `.tox`), `settings_template.ini` |
+
+## Relationship to Plugin_FFT
+
+[`Plugin_FFT`](../Plugin_FFT) is the reference consumer of this builder — a production C++ CHOP
+(FFTW3 / oneMKL spectrum analysis) that lives in a sibling folder and is built *through* this tool:
+
+| Shared contract | How Plugin_FFT uses it |
+|---|---|
+| `include(${PLUGIN_BUILDER_DIR}/cmake/TDPlugin.cmake)` + `td_add_plugin(FFT FAMILY CHOP)` | `Plugin_FFT/PluginProjects/FFT/CMakeLists.txt` resolves `PLUGIN_BUILDER_DIR` via the sibling path `../../../PluginBuilder_V2` (or `-DPLUGIN_BUILDER_DIR=`) |
+| `td_plugin_use_fftw3(... VERSION 3.3.11-avx2 DYNAMIC)` | Pulls the vendored FFTW from `Plugin_FFT/PluginProjects/FFT/3rdParty/fftw3` with no import library linked into the plugin DLL |
+| `td_plugin_optimize(FFT AVX2 FAST_MATH LTO)` | `/O2 /Oi /Ot /Gy /arch:AVX2 /fp:fast /GL /LTCG` |
+| `plugin.json` manifest | Declares family `CHOP`, optype `Fftcustom`, deps — reopened when you type `FFT` as the plugin name |
+| `__Plugins__/FFT/` + rename-in-place swap | Standalone `_b.bat` and PluginBuilder hot-reload both deploy `FFT.dll` + `libfftw3f-*.dll` there; TD loads from this path |
+| `dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT` | Cross-repo configure + build used as a smoke test |
+| Hot-reload parameter refresh (2.1.1) | Discovered while iterating on FFT's `Planner = Patient` menu entry — TD keeps stale par objects across re-init, so Ext now unloads, recreates the loader, reloads, and restores values |
+
+Plugin_FFT's own docs (README, CHANGELOG, optimization analysis, roadmap) describe the *DSP* side;
+this repository describes the *build/hot-reload* side. When you change a CMake function, a manifest
+key, or the loader lifecycle, run both `python dev/ci.py --all` and
+`python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT`.
+
 ## Contributing
 
-Issues and pull requests are welcome — please run `python dev/ci.py --all` before opening one.
+Issues and pull requests are welcome — please run `python dev/ci.py --all` (and, if you touched the
+CMake module or extension lifecycle, the Plugin_FFT cross-repo build) before opening one.

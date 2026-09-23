@@ -20,6 +20,7 @@
 
 #include "TOP_CPlusPlusBase.h"
 
+// A filled TOP_Buffer plus the TOP_UploadInfo describing its texture.
 class BufferInfo
 {
 public:
@@ -27,6 +28,11 @@ public:
 	TD::TOP_UploadInfo					uploadInfo;
 
 };
+// Producer/consumer queue used by the THREADING_EXAMPLE mode of CPUMemoryTOP.
+// A producer thread calls getBufferToUpdate() then updateComplete() (or
+// updateCancelled()); execute() on the main thread calls getBufferToUpload().
+// The lock is only held to move buffers in/out of the deque, never while
+// allocating, so the main thread does not wait on the producer.
 class FrameQueue
 {
 public:
@@ -49,6 +55,9 @@ public:
 
 	// If there is a new buffer to upload, BufferInfo.buf will not be nullptr.
 	// You are the owner of BufferInfo.buf if this returns a non-nullptr
+	// Latest wins: returns the newest completed frame and drops older ones, so
+	// the TOP never shows a frame that is already out of date.
+	// Call it from execute() (dropped buffers are handed back to the TOP_Context).
 	BufferInfo			getBufferToUpload();
 
 private:

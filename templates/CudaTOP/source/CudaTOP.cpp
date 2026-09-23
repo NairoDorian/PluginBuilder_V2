@@ -24,6 +24,8 @@
 // you are creating
 extern "C"
 {
+// Called once when the DLL is loaded: API version, execute mode (CUDA here),
+// operator metadata (filled in when the plugin is generated) and input counts.
 DLLEXPORT
 void
 FillTOPPluginInfo(TOP_PluginInfo *info)
@@ -58,6 +60,7 @@ FillTOPPluginInfo(TOP_PluginInfo *info)
 	info->customOPInfo.opHelpURL->setString("#__OP_HELPURL__#");
 }
 
+// The CudaTOP constructor creates the node's CUDA stream.
 DLLEXPORT
 TOP_CPlusPlusBase*
 CreateTOPInstance(const OP_NodeInfo* info, TOP_Context *context)
@@ -70,6 +73,7 @@ CreateTOPInstance(const OP_NodeInfo* info, TOP_Context *context)
 	return new CudaTOP(info, context);
 }
 
+// The CudaTOP destructor destroys the surface objects and the CUDA stream.
 DLLEXPORT
 void
 DestroyTOPInstance(TOP_CPlusPlusBase* instance, TOP_Context *context)
@@ -89,13 +93,17 @@ DestroyTOPInstance(TOP_CPlusPlusBase* instance, TOP_Context *context)
 
 CudaTOP::CudaTOP(const OP_NodeInfo* info, TOP_Context *context) :
 	myNodeInfo(info), myExecuteCount(0),
-	myError(nullptr),
 	myInputSurface(0),
 	myStream(0),
 	myContext(context)
 {
 	myOutputSurfaces.fill(0);
-	cudaStreamCreate(&myStream);
+	// Non-blocking: work on this stream does not implicitly synchronize with the
+	// legacy default stream. TouchDesigner syncs with it through the stream
+	// passed in TOP_CUDAOutputInfo / OP_CUDAAcquireInfo.
+	// If creation fails myStream stays 0 (the default stream) and still works.
+	if (cudaStreamCreateWithFlags(&myStream, cudaStreamNonBlocking) != cudaSuccess)
+		myStream = 0;
 }
 
 CudaTOP::~CudaTOP()
@@ -145,10 +153,13 @@ setupCudaSurface(cudaSurfaceObject_t* surface, cudaArray_t array)
 	}
 }
 
+// Cook. Requests the CUDA arrays (input, primary output, 1280x720 aux output in
+// color buffer 1), then runs the kernels from kernel.cu between
+// beginCUDAOperations() and endCUDAOperations(). Errors go to getErrorString().
 void
 CudaTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void* reserved)
 {
-	myError = nullptr;
+	myError.clear();
 	myExecuteCount++;
 
 	TOP_CUDAOutputInfo info;
@@ -164,6 +175,8 @@ CudaTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void* reserved)
 	if (inputs->getNumInputs() > 0)
 	{
 		const OP_TOPInput* topInput = inputs->getInputTOP(0);
+		if (!topInput)
+			return;
 
 		// Make our output texture match our input texture.
 		info.textureDesc = topInput->textureDesc;
@@ -212,8 +225,9 @@ CudaTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void* reserved)
 	setupCudaSurface(&myOutputSurfaces[0], outputInfo->cudaArray);
 	if (inputArray)
 		setupCudaSurface(&myInputSurface, inputArray->cudaArray);
-	else
+	else if (myInputSurface)
 	{
+		// 0 is not a valid surface object, so only destroy a real one.
 		cudaDestroySurfaceObject(myInputSurface);
 		myInputSurface = 0;
 	}
@@ -224,7 +238,7 @@ CudaTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void* reserved)
 	c.z = (float)color1[2];
 	c.w = 1.0f;
 
-	doCUDAOperation(info.textureDesc.width, info.textureDesc.height, info.textureDesc.depth, info.textureDesc.texDim, c, myInputSurface, myOutputSurfaces[info.colorBufferIndex], myStream);
+	cudaError_t status = doCUDAOperation(info.textureDesc.width, info.textureDesc.height, info.textureDesc.depth, info.textureDesc.texDim, c, myInputSurface, myOutputSurfaces[info.colorBufferIndex], myStream);
 
 	setupCudaSurface(&myOutputSurfaces[auxInfo.colorBufferIndex], auxOutputInfo->cudaArray);
 		
@@ -233,16 +247,25 @@ CudaTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void* reserved)
 	c.z = (float)color2[2];
 	c.w = 1.0f;
 
-	doCUDAOperation(auxInfo.textureDesc.width, auxInfo.textureDesc.height, auxInfo.textureDesc.depth, auxInfo.textureDesc.texDim, c, 0, myOutputSurfaces[auxInfo.colorBufferIndex], myStream);
+	cudaError_t auxStatus = doCUDAOperation(auxInfo.textureDesc.width, auxInfo.textureDesc.height, auxInfo.textureDesc.depth, auxInfo.textureDesc.texDim, c, 0, myOutputSurfaces[auxInfo.colorBufferIndex], myStream);
 
+	// Always pair beginCUDAOperations() with endCUDAOperations(), even on error.
 	myContext->endCUDAOperations(nullptr);
+
+	if (status == cudaSuccess)
+		status = auxStatus;
+	if (status != cudaSuccess)
+	{
+		myError = "CUDA error: ";
+		myError += cudaGetErrorString(status);
+	}
 }
 
 int32_t
 CudaTOP::getNumInfoCHOPChans(void* reserved)
 {
 	// We return the number of channel we want to output to any Info CHOP
-	// connected to the TOP. In this example we are just going to send one channel.
+	// connected to the TOP. In this example we send one channel.
 	return 1;
 }
 
@@ -303,7 +326,8 @@ CudaTOP::getInfoDATEntries(int32_t index,
 void
 CudaTOP::getErrorString(OP_String *error, void* reserved)
 {
-	error->setString(myError);
+	if (!myError.empty())
+		error->setString(myError.c_str());
 }
 
 void
@@ -334,7 +358,7 @@ CudaTOP::setupParameters(OP_ParameterManager* manager, void* reserved)
 		assert(res == OP_ParAppendResult::Success);
 	}
 	
-	// color 1
+	// color 2
 	{
 		OP_NumericParameter	np;
 

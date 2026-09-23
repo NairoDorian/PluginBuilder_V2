@@ -26,6 +26,8 @@
 extern "C"
 {
 
+	// Called once when the DLL is loaded: API version, operator metadata (filled
+	// in when the plugin is generated) and input counts.
 	DLLEXPORT
 	void
 	FillSOPPluginInfo(SOP_PluginInfo *info)
@@ -90,6 +92,8 @@ SimpleShapesSOP::SimpleShapesSOP(const OP_NodeInfo* info) : myNodeInfo(info)
 	myChopChanVal = 0;
 
 	myDat = "N/A";
+
+	myNumVBOTexLayers = 0;
 }
 
 SimpleShapesSOP::~SimpleShapesSOP()
@@ -100,7 +104,8 @@ SimpleShapesSOP::~SimpleShapesSOP()
 void
 SimpleShapesSOP::getGeneralInfo(SOP_GeneralInfo* ginfo, const OP_Inputs* inputs, void* reserved)
 {
-	// This will cause the node to cook every frame
+	// Set this to true to cook every frame (when asked); false cooks only
+	// when an input or parameter changes.
 	ginfo->cookEveryFrameIfAsked = false;
 
 	//if direct to GPU loading:
@@ -369,6 +374,10 @@ SimpleShapesSOP::triangleGeometry(SOP_Output* output)
 
 }
 
+// CPU cook (GPU Direct off). With an input connected, points, normals, colors,
+// texcoords, custom attributes and polygons are copied from it. Without one,
+// the Shape menu selects the generated geometry; the first sample of the Chop
+// parameter's first channel multiplies Scale.
 void
 SimpleShapesSOP::execute(SOP_Output* output, const OP_Inputs* inputs, void* reserved)
 {
@@ -381,6 +390,8 @@ SimpleShapesSOP::execute(SOP_Output* output, const OP_Inputs* inputs, void* rese
 		inputs->enablePar("Scale", 0);  // not used
 
 		const OP_SOPInput	*sinput = inputs->getInputSOP(0);
+		if (!sinput)
+			return;
 
 		const Position* ptArr = sinput->getPointPositions();
 		const Vector* normals = nullptr;
@@ -398,10 +409,12 @@ SimpleShapesSOP::execute(SOP_Output* output, const OP_Inputs* inputs, void* rese
 			colors = sinput->getColors()->colors;
 		}
 
-		if (sinput->getTextures()->numTextureLayers)
+		// getTextures() returns nullptr when the input has no texture layers.
+		const SOP_TextureInfo* texInfo = sinput->getTextures();
+		if (texInfo && texInfo->numTextureLayers)
 		{
-			textures = sinput->getTextures()->textures;
-			numTextures = sinput->getTextures()->numTextureLayers;
+			textures = texInfo->textures;
+			numTextures = texInfo->numTextureLayers;
 		}
 
 		for (int i = 0; i < sinput->getNumPoints(); i++)
@@ -447,15 +460,33 @@ SimpleShapesSOP::execute(SOP_Output* output, const OP_Inputs* inputs, void* rese
 			const SOP_PrimitiveInfo primInfo = sinput->getPrimitive(i);
 
 			const int32_t* primVert = primInfo.pointIndices;
+			const int32_t numVerts = primInfo.numVertices;
 
-			// Note: the addTriangle() assumes that the input SOP has triangulated geometry,
-			// if the input geometry is not a triangle, you need to convert it to triangles first:
-			output->addTriangle(*(primVert), *(primVert + 1), *(primVert + 2));
+			// The official sample called addTriangle() on every primitive, which
+			// reads past the end of the index array for primitives with fewer than
+			// 3 vertices and drops the extra vertices of larger polygons.
+			if (!primVert || numVerts < 2)
+				continue;
+
+			// Open polygons are polylines.
+			if (!primInfo.isClosed)
+			{
+				output->addLine(primVert, numVerts);
+				continue;
+			}
+
+			// Closed polygons: fan triangulation (exact for triangles, correct for
+			// convex polygons; triangulate concave input upstream, e.g. Divide SOP).
+			for (int32_t v = 1; v + 1 < numVerts; v++)
+			{
+				output->addTriangle(primVert[0], primVert[v], primVert[v + 1]);
+			}
 		}
 
 	}
 	else
 	{
+		inputs->enablePar("Reset", 1);	// disabled above while an input was connected
 		inputs->enablePar("Shape", 1);
 
 		int shape = inputs->getParInt("Shape");
@@ -463,9 +494,9 @@ SimpleShapesSOP::execute(SOP_Output* output, const OP_Inputs* inputs, void* rese
 		inputs->enablePar("Scale", 1);
 		double	 scale = inputs->getParDouble("Scale");
 
-		// if there is a input chop parameter:
+		// if there is a input chop parameter (with at least one sample to read):
 		const OP_CHOPInput	*cinput = inputs->getParCHOP("Chop");
-		if (cinput)
+		if (cinput && cinput->numChannels > 0 && cinput->numSamples > 0)
 		{
 			int numSamples = cinput->numSamples;
 			int ind = 0;
@@ -584,9 +615,12 @@ fillFaceVBO(SOP_VBOOutput* output,
 
 		if (output->hasTexCoord() && texCoordOut)
 		{
-			for (int t = 0; t < numTexLayers +1; t++)
+			// The input arrays hold one TexCoord per vertex: write it to each of
+			// the numTexLayers layers. The official sample wrote numTexLayers + 1
+			// per vertex from inTexCoord[k * 2 + t], out of range of both arrays.
+			for (int t = 0; t < numTexLayers; t++)
 			{
-				*(texCoordOut++) = inTexCoord[(k * (numTexLayers + 1) + t)];
+				*(texCoordOut++) = inTexCoord[k];
 			}
 		}
 		k++;
@@ -638,9 +672,12 @@ fillLineVBO(SOP_VBOOutput* output,
 
 		if (output->hasTexCoord() && texCoordOut)
 		{
-			for (int t = 0; t < numTexLayers + 1; t++)
+			// The input arrays hold one TexCoord per vertex: write it to each of
+			// the numTexLayers layers. The official sample wrote numTexLayers + 1
+			// per vertex from inTexCoord[k * 2 + t], out of range of both arrays.
+			for (int t = 0; t < numTexLayers; t++)
 			{
-				*(texCoordOut++) = inTexCoord[(k * (numTexLayers + 1) + t)];
+				*(texCoordOut++) = inTexCoord[k];
 			}
 		}
 		k++;
@@ -693,9 +730,12 @@ fillParticleVBO(SOP_VBOOutput* output,
 
 		if (output->hasTexCoord() && texCoordOut)
 		{
-			for (int t = 0; t < numTexLayers + 1; t++)
+			// The input arrays hold one TexCoord per vertex: write it to each of
+			// the numTexLayers layers. The official sample wrote numTexLayers + 1
+			// per vertex from inTexCoord[k * 2 + t], out of range of both arrays.
+			for (int t = 0; t < numTexLayers; t++)
 			{
-				*(texCoordOut++) = inTexCoord[(k * (numTexLayers + 1) + t)];
+				*(texCoordOut++) = inTexCoord[k];
 			}
 		}
 		k++;
@@ -977,7 +1017,9 @@ SimpleShapesSOP::triangleGeometryVBO(SOP_VBOOutput* output)
 	int32_t vertices[] = { 0, 1, 2 };
 
 	// fill in the VBO buffers for this triangle:
-	fillFaceVBO(output, pointArr, normals, color, nullptr, vertices, 1, myNumVBOTexLayers, 1);
+	// 1 face of 3 vertices, 1 triangle (the official sample passed the texture
+	// layer count as the triangle count).
+	fillFaceVBO(output, pointArr, normals, color, nullptr, vertices, 1, 1, myNumVBOTexLayers);
 
 	return;
 }
@@ -1133,6 +1175,21 @@ SimpleShapesSOP::particleGeometryVBO(SOP_VBOOutput* output)
 }
 
 
+// The custom attributes are declared with addCustomAttribute() but this example
+// has no data for them. VBO memory is not initialized, so write zeros instead of
+// leaving undefined values (the official sample never wrote them).
+static void
+zeroCustomAttributeVBO(SOP_VBOOutput* output, const char* name, int32_t numComponents, int32_t numVertices)
+{
+	SOP_CustomAttribData cu;
+	if (output->getCustomAttribute(&cu, name) && cu.floatData)
+		memset(cu.floatData, 0, sizeof(float) * size_t(numComponents) * size_t(numVertices));
+}
+
+// GPU Direct cook (the Gpudirect toggle sets directToGPU in getGeneralInfo).
+// Geometry is written straight into VBOs: it can be rendered but not used by
+// other SOPs. The shape is chosen at compile time (CUBE_VBO/LINE_VBO/PARTICLE_VBO);
+// an input SOP is ignored in this mode.
 void
 SimpleShapesSOP::executeVBO(SOP_VBOOutput* output,
 						const OP_Inputs* inputs,
@@ -1164,7 +1221,7 @@ SimpleShapesSOP::executeVBO(SOP_VBOOutput* output,
 		// however it is possible to have DAT or TOP inputs as well
 
 		const OP_CHOPInput	*cinput = inputs->getParCHOP("Chop");
-		if (cinput)
+		if (cinput && cinput->numChannels > 0 && cinput->numSamples > 0)
 		{
 			int numSamples = cinput->numSamples;
 			int ind = 0;
@@ -1202,6 +1259,8 @@ SimpleShapesSOP::executeVBO(SOP_VBOOutput* output,
 			int32_t numIndices = 36;
 
 			output->allocVBO(numVertices, numIndices, VBOBufferMode::Static);
+			zeroCustomAttributeVBO(output, "customColor", 4, numVertices);
+			zeroCustomAttributeVBO(output, "customVert", 1, numVertices);
 
 			cubeGeometryVBO(output, (float)scale);
 			output->setBoundingBox(BoundingBox(1.0f, -1.0f, -1.0f, 3.0f, 1.0f, 1.0f));
@@ -1213,6 +1272,8 @@ SimpleShapesSOP::executeVBO(SOP_VBOOutput* output,
 			int32_t numIndices = 10;
 
 			output->allocVBO(numVertices, numIndices, VBOBufferMode::Static);
+			zeroCustomAttributeVBO(output, "customColor", 4, numVertices);
+			zeroCustomAttributeVBO(output, "customVert", 1, numVertices);
 
 			lineGeometryVBO(output);
 		}
@@ -1223,6 +1284,8 @@ SimpleShapesSOP::executeVBO(SOP_VBOOutput* output,
 			int32_t numIndices = 27;
 
 			output->allocVBO(numVertices, numIndices, VBOBufferMode::Static);
+			zeroCustomAttributeVBO(output, "customColor", 4, numVertices);
+			zeroCustomAttributeVBO(output, "customVert", 1, numVertices);
 
 			particleGeometryVBO(output);
 		}
@@ -1243,7 +1306,7 @@ int32_t
 SimpleShapesSOP::getNumInfoCHOPChans(void* reserved)
 {
 	// We return the number of channel we want to output to any Info CHOP
-	// connected to the CHOP. In this example we are just going to send 4 channels.
+	// connected to the SOP. In this example we send 4 channels.
 	return 4;
 }
 
@@ -1252,7 +1315,7 @@ SimpleShapesSOP::getInfoCHOPChan(int32_t index,
 								OP_InfoCHOPChan* chan, void* reserved)
 {
 	// This function will be called once for each channel we said we'd want to return
-	// In this example it'll only be called once.
+	// (four times in this example).
 
 	if (index == 0)
 	{
@@ -1339,20 +1402,11 @@ SimpleShapesSOP::getInfoDATEntries(int32_t index,
 	if (index == 2)
 	{
 		// Set the value for the first column
-#ifdef _WIN32
-		strcpy_s(tempBuffer, "DAT input name");
-#else // macOS
-		strlcpy(tempBuffer, "offset", sizeof(tempBuffer));
-#endif
-		entries->values[0]->setString(tempBuffer);
+		entries->values[0]->setString("DAT input name");
 
-		// Set the value for the second column
-#ifdef _WIN32
-		strcpy_s(tempBuffer, myDat.c_str());
-#else // macOS
-		snprintf(tempBuffer, sizeof(tempBuffer), "%g", myOffset);
-#endif
-		entries->values[1]->setString(tempBuffer);
+		// Set the value for the second column (the official sample printed the
+		// offset here on macOS). setString copies, no intermediate buffer needed.
+		entries->values[1]->setString(myDat.c_str());
 	}
 }
 

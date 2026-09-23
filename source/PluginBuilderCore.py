@@ -19,6 +19,26 @@ Contents
 - parameters               par_signature, BUILTIN_LOADER_PARS, is_persisted_par,
                             snapshot_par, restore_action, parameter_definition_diff
 - IDE                      render_vscode_files
+
+Contracts (stable, depended on by Plugin_FFT and tests/test_core.py)
+-------------------------------------------------------------------
+* PLUGIN_BUILDER_DIR / td_add_plugin / td_plugin_use_fftw3 live in cmake/TDPlugin.cmake;
+  generated CMakeLists.txt only includes them (see CMakeBlocks.assemble).
+* plugin.json is the primary manifest (family/name/features); the legacy
+  "# {'plugin_type': '...'}" CMakeLists first-line header is still parsed for old
+  projects (plugin_type_from_cmake_header, read_plugin_manifest).
+* Deploy: built DLL -> __Plugins__/<name>/ via rename-in-place (safe_replace_file;
+  the standalone path is cmake/TDDeploy.cmake) so a DLL already mapped by
+  TouchDesigner can still be replaced (Windows allows renaming loaded DLLs).
+* Builds run under PLUGINBUILDER_BUILD=1 (set by PluginBuilderExt._env_factory);
+  when that env is set, TDPlugin.cmake skips its own POST_BUILD deploy.
+* Sibling repo ../Plugin_FFT is a consumer of this SDK contract (FFTW3 3.3.11-avx2
+  DYNAMIC layout, API-10 headers). It is referenced only for context — never modified here.
+
+Known facts: API 10 headers; toolchain = CMake + Ninja + MSVC; 29 unit tests in
+tests/test_core.py must stay green; version v2.1.4. 2.1.1 added hot-reload
+parameter-definition refresh (_reload_loader_fresh, discovered via Plugin_FFT's
+Planner=Patient menu changing at runtime).
 """
 
 import configparser
@@ -33,8 +53,13 @@ import sys
 import threading
 import time
 
+# Plugin families supported end-to-end (template -> CMake FAMILY -> cplusplus loader op).
+# POP is guarded at the TD-adapter layer: older TouchDesigner builds have no cplusplusPOP
+# (see PluginBuilderExt.loader_op_map).
 FAMILIES = ('CHOP', 'TOP', 'DAT', 'SOP', 'POP')
 
+# Fallback when a template/ has no template.json (pre-manifest layout kept for
+# backward compatibility; load_templates prefers template.json when present).
 _LEGACY_TEMPLATE_MAP = {
     'BasicCHOP':           {'family': 'CHOP', 'features': []},
     'CHOPWithPythonClass': {'family': 'CHOP', 'features': ['python']},
@@ -54,7 +79,14 @@ _NAME_RX = re.compile(r'^[A-Za-z][A-Za-z0-9_]*$')
 
 
 def validate_plugin_name(name):
-    """Return (ok, message). A plugin name is used as CMake target, C++ class name, file name and DLL name."""
+    """Return (ok, message). A plugin name is used as CMake target, C++ class name, file name and DLL name.
+
+    Must be a valid CMake target / filesystem identifier: start with a letter, then
+    letters/digits/'_' only. Reserved words that would collide with generated
+    CMake targets or folder names (build, source, test, ...) are rejected —
+    a project dir PluginProjects/<name> plus build/ and source/ subfolders is
+    created under that name (create_plugin).
+    """
     if not name:
         return False, 'Plugin name is empty.'
     if not _NAME_RX.match(name):
@@ -66,7 +98,12 @@ def validate_plugin_name(name):
 
 
 def sanitize_op_type(name, fallback='Customop'):
-    """TouchDesigner opType rule: first char A-Z, remaining chars a-z0-9 only."""
+    """TouchDesigner opType rule: first char A-Z, remaining chars a-z0-9 only.
+
+    opType becomes the C++ class-facing type string written into
+    Fill*PluginInfo via the #__OP_TYPE__# placeholder (template_replacements).
+    Pure punctuation/digits -> fallback. Example: 'FFT_v2' -> 'Fftv2'.
+    """
     alnum = re.sub(r'[^A-Za-z0-9]', '', name or '')
     if not alnum:
         return fallback
@@ -77,12 +114,22 @@ def sanitize_op_type(name, fallback='Customop'):
 
 
 def make_op_icon(name):
+    """3-letter node icon derived from the plugin name (always exactly 3 chars, A-Z0-9).
+
+    Empty/non-alnum -> 'CST'; short names are right-padded with 'X' (e.g. 'a' -> 'AXX').
+    Written into Fill*PluginInfo via #__OP_ICON__# (template_replacements).
+    """
     alnum = re.sub(r'[^A-Za-z0-9]', '', name or '').upper()
     return (alnum[:3] or 'CST').ljust(3, 'X')
 
 
 def td_project_name(project_name):
-    """'Plugin_FFT.94.toe' -> 'Plugin_FFT', 'my.project.toe' -> 'my.project', 'demo' -> 'demo'."""
+    """Strip .toe and TD's autosave numeric suffix: 'Plugin_FFT.94.toe' -> 'Plugin_FFT',
+    'my.project.toe' -> 'my.project', 'demo' -> 'demo'.
+
+    Used for launch.vs.json / .vscode paths that must name the .toe next to the
+    project (PluginBuilderExt._write_launch_vs_json, _write_vscode_files).
+    """
     base = project_name or ''
     if base.lower().endswith('.toe'):
         base = base[:-4]
@@ -99,6 +146,11 @@ def td_project_name(project_name):
 # =================================================================================================
 
 def expand_user_path(value, user_home):
+    """Expand ${USER_PATH} / %USERPROFILE% and shell vars, then normalize.
+
+    settings.ini lives under %APPDATA%/IntentDev/PluginBuilder/ and commonly
+    writes ${USER_PATH}/... so the same file works across machines.
+    """
     if value is None:
         return ''
     value = value.strip().strip('"')
@@ -107,7 +159,14 @@ def expand_user_path(value, user_home):
 
 
 def parse_settings(text, user_home):
-    """Parse settings.ini text into a dict. Never raises; problems are returned in ['errors']."""
+    """Parse settings.ini text into a dict. Never raises; problems are returned in ['errors'].
+
+    Sections: [Paths] (PluginBuilderDir, NinjaDir, VCVarsall, CMakeDir, SdkIncludeDir),
+    [PluginInfo] (Author/Email/HelpURL -> #__OP_*__# placeholders), [Options]
+    (LogLevel, Arch, ParallelJobs, MirrorPages). Presence of a [DevMode] section
+    sets result['dev_mode'] (keeps Create pars enabled after create_plugin).
+    Called from PluginBuilderExt.__init__ and dev/ci.py:load_settings.
+    """
     result = {
         'paths': {'PluginBuilderDir': '', 'NinjaDir': '', 'VCVarsall': '', 'CMakeDir': '', 'SdkIncludeDir': ''},
         'plugininfo': {'Author': 'Author Name', 'Email': 'email@email.com', 'HelpURL': ''},
@@ -144,6 +203,11 @@ def _vswhere_path():
     return None
 
 
+# Hidden console window so vswhere/child tools don't flash over the TD UI
+# (same flag used by BuildRunner / capture_vc_env).
+CREATE_NO_WINDOW = 0x08000000
+
+
 def _run_quiet(args, timeout=20):
     try:
         flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
@@ -154,7 +218,11 @@ def _run_quiet(args, timeout=20):
 
 
 def find_visual_studio():
-    """Return (installationPath, displayName) of the newest VS with the C++ x64 toolset, or (None, None)."""
+    """Return (installationPath, displayName) of the newest VS with the C++ x64 toolset, or (None, None).
+
+    Uses vswhere.exe (ships with VS Installer). Pre-release installs are included
+    so preview VS builds work. Consumed by discover_toolchain.
+    """
     vswhere = _vswhere_path()
     if not vswhere:
         return None, None
@@ -169,7 +237,13 @@ def find_visual_studio():
 
 
 def discover_toolchain(settings_paths, extra_search_dirs=()):
-    """Resolve vcvarsall / ninja / cmake. settings.ini values win; otherwise vswhere + PATH + VS bundled tools."""
+    """Resolve vcvarsall / ninja / cmake. settings.ini values win; otherwise vswhere + PATH + VS bundled tools.
+
+    Returns info = {'vcvarsall','ninja_dir','cmake_dir','vs_path','sources','errors'} where
+    'sources' maps each tool to where it was found ('settings.ini' | 'vswhere (...)' |
+    'PATH' | 'Visual Studio bundled' | 'search dir') for the [Init] log.
+    Called from PluginBuilderExt.check_paths and dev/ci.py:main.
+    """
     info = {'vcvarsall': '', 'ninja_dir': '', 'cmake_dir': '', 'vs_path': '', 'sources': {}, 'errors': []}
     vs_path, vs_name = find_visual_studio()
     info['vs_path'] = vs_path or ''
@@ -216,7 +290,14 @@ def discover_toolchain(settings_paths, extra_search_dirs=()):
 
 
 def capture_vc_env(vcvarsall, arch='x64', extra_path_dirs=(), extra_env=None, timeout=120):
-    """Run vcvarsall once and return the resulting environment dict (or raise RuntimeError)."""
+    """Run vcvarsall once and return the resulting environment dict (or raise RuntimeError).
+
+    Shell: `cmd /s /c ""<vcvarsall>" x64 >nul 2>&1 && set"` — stdout is parsed as KEY=VALUE.
+    Extra PATH entries (ninja_dir, cmake_dir) are prepended; extra_env is applied last so
+    callers can force PLUGINBUILDER_BUILD=1 / PLUGIN_BUILDER_DIR / TD_SAMPLES_DIR
+    (see PluginBuilderExt._env_factory, dev/ci.py:main). Raises RuntimeError if the MSVC
+    environment did not initialise (no VCToolsInstallDir/VCINSTALLDIR in the dump).
+    """
     if not vcvarsall or not os.path.exists(vcvarsall):
         raise RuntimeError(f'vcvarsall.bat not found: {vcvarsall}')
     cmdline = f'cmd.exe /s /c ""{vcvarsall}" {arch} >nul 2>&1 && set"'
@@ -246,7 +327,15 @@ def capture_vc_env(vcvarsall, arch='x64', extra_path_dirs=(), extra_env=None, ti
 # =================================================================================================
 
 def load_templates(templates_dir):
-    """Discover templates: templates/<Name>/template.json (preferred) or legacy folder layout."""
+    """Discover templates: templates/<Name>/template.json (preferred) or legacy folder layout.
+
+    Each entry needs a source/ subfolder and family in FAMILIES (from template.json,
+    else _LEGACY_TEMPLATE_MAP). Metadata keys: name, family, replace (class/file stem
+    to rename), main_source, features (cuda/python/opencv), description, api_version,
+    sources (list of files under source/). Consumed by PluginBuilderExt._populate_template_menu
+    and create_plugin; tests/test_core.py:TemplateTests asserts BasicCHOP is present and
+    every main_source contains all #__OP_*__# placeholders plus setAPIVersion( (API 10).
+    """
     templates = {}
     if not templates_dir or not os.path.isdir(templates_dir):
         return templates
@@ -277,6 +366,12 @@ def load_templates(templates_dir):
 
 
 def template_replacements(plugin_name, op_type, op_label, op_icon, author, email, help_url=''):
+    """Placeholder -> value map substituted into template sources by render_source.
+
+    Placeholders are the #...# tokens written by dev/sync_templates.py:templatize
+    (META_RULES). op_type/op_icon come from sanitize_op_type / make_op_icon;
+    author/email/help_url come from settings.ini [PluginInfo].
+    """
     return {
         '#__OP_TYPE__#': op_type,
         '#__OP_LABEL__#': op_label,
@@ -288,8 +383,57 @@ def template_replacements(plugin_name, op_type, op_label, op_icon, author, email
     }
 
 
+def scaffold_template_files(meta, project_dir, plugin_name, replacements):
+    """Materialise a template's files into project_dir. Returns the list of written relative paths.
+
+    * templates/<T>/source/*  -> <project>/source/   (file names renamed like the class)
+    * templates/<T>/project/** -> <project>/**       (optional: tests/, bench/, parameters.json, ...)
+    * template.json "generate_parameters": true      -> source/Parameters.h/.cpp from parameters.json
+      (ParamGen.generate_files), so a template can ship its parameters as a spec
+    Every text file goes through render_source (class rename + #__OP_*__# placeholders). Shared by
+    PluginBuilderExt.create_plugin and dev/ci.py:scaffold so the two cannot drift apart.
+    """
+    replace = meta.get('replace', meta['name'])
+    written = []
+    tdir = meta['dir']
+    for sub, dest_sub in (('source', 'source'), ('project', '')):
+        src_root = os.path.join(tdir, sub)
+        if not os.path.isdir(src_root):
+            continue
+        for root, _dirs, files in os.walk(src_root):
+            for fn in sorted(files):
+                src = os.path.join(root, fn)
+                rel = os.path.relpath(src, src_root)
+                rel_out = os.path.join(dest_sub, os.path.dirname(rel), fn.replace(replace, plugin_name)) if dest_sub \
+                    else os.path.join(os.path.dirname(rel), fn.replace(replace, plugin_name))
+                dst = os.path.join(project_dir, rel_out)
+                os.makedirs(os.path.dirname(dst) or project_dir, exist_ok=True)
+                with open(src, 'r', encoding='utf-8', errors='replace') as f:
+                    text = f.read()
+                with open(dst, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(render_source(text, replace, plugin_name, replacements))
+                written.append(rel_out.replace('\\', '/'))
+    if meta.get('generate_parameters'):
+        spec = os.path.join(project_dir, 'parameters.json')
+        if os.path.exists(spec):
+            import ParamGen  # noqa: E402  (source/ is on the path wherever Core is)
+            ParamGen.generate_files(spec, os.path.join(project_dir, 'source'))
+            written += ['source/Parameters.h', 'source/Parameters.cpp']
+    return written
+
+
+def template_cmake_lines(meta, plugin_name):
+    """Extra CMakeLists lines a template asks for (template.json "cmake": [...]), with the name filled in."""
+    return [ln.replace('__PLUGIN_NAME__', plugin_name) for ln in meta.get('cmake', [])]
+
+
 def render_source(text, replace_name, plugin_name, replacements=None):
-    """Rename the template class/file identifiers and substitute metadata placeholders."""
+    """Rename the template class/file identifiers and substitute metadata placeholders.
+
+    Order matters: replace_name (e.g. 'BasicCHOP') and its UPPER form are swapped for
+    plugin_name first, then #__OP_*__# / #__PLUGIN_NAME__# tokens are filled in.
+    Called from create_plugin and dev/ci.py:scaffold.
+    """
     text = text.replace(replace_name, plugin_name)
     text = text.replace(replace_name.upper(), plugin_name.upper())
     for k, v in (replacements or {}).items():
@@ -301,11 +445,17 @@ def render_source(text, replace_name, plugin_name, replacements=None):
 #  Manifests
 # =================================================================================================
 
+# Primary per-project manifest (written by write_plugin_manifest from create_plugin;
+# read back by read_plugin_manifest when loading an existing PluginProject).
 MANIFEST_NAME = 'plugin.json'
 
 
 def plugin_type_from_cmake_header(first_line):
-    """Parse the legacy '# {'plugin_type': 'CHOP'}' header. Returns family or None."""
+    """Parse the legacy '# {'plugin_type': 'CHOP'}' header. Returns family or None.
+
+    First line of generated CMakeLists.txt (CMakeBlocks.HEADER). ast.literal_eval only —
+    never exec — so a malicious/odd header cannot run code (test_header_parse covers this).
+    """
     import ast
     if not first_line or not first_line.startswith('#'):
         return None
@@ -320,7 +470,12 @@ def plugin_type_from_cmake_header(first_line):
 
 
 def read_plugin_manifest(project_dir):
-    """Return manifest dict for a project (plugin.json, else derived from CMakeLists header). None if not a project."""
+    """Return manifest dict for a project (plugin.json, else derived from CMakeLists header). None if not a project.
+
+    plugin.json wins when family is valid; otherwise the legacy CMakeLists first-line
+    header is parsed and a {'legacy': True} stub is returned. None means "not a
+    PluginProject" (used by onPluginname to decide create-vs-load).
+    """
     jpath = os.path.join(project_dir, MANIFEST_NAME)
     if os.path.exists(jpath):
         try:
@@ -359,7 +514,15 @@ _RX_NVCC = re.compile(r'^(?P<file>.+?)\((?P<line>\d+)\)\s*:\s*(?P<sev>error|warn
 
 
 def parse_diagnostics(lines):
-    """Parse compiler/linker/CMake/Ninja output lines into dicts: {severity, file, line, col, code, message, raw}."""
+    """Parse compiler/linker/CMake/Ninja output lines into dicts: {severity, file, line, col, code, message, raw}.
+
+    Order tried per line: MSVC (file(line,col): error Cxxxx) -> LNK -> "CMake Error at
+    file:line" (body grabbed from the next two-space-indented line) -> plain
+    "CMake Error: ..." -> "ninja: error:" -> NVCC. Exact duplicates are dropped
+    (dedupe_consecutive is for the human-readable rendering path). Used by
+    build/compile on_done in PluginBuilderExt and dev/ci.py:build_project;
+    tests/test_core.py:DiagnosticsTests covers MSVC+linker and CMake cases.
+    """
     diags = []
     seen = set()
     pending_cmake = None
@@ -435,46 +598,117 @@ def file_sha256(path, chunk=1 << 20):
     return h.hexdigest()
 
 
+def files_identical(a, b):
+    """True when a and b have identical content, hashing only when the cheap checks cannot decide.
+
+    Fast paths, in order (no file content read):
+      * different sizes                      -> different
+      * same size and same mtime (ns)        -> identical  (shutil.copy2 preserves mtime, so a file
+                                                deployed by safe_replace_file keeps its source's stamp)
+    Only a same-size / different-mtime pair is SHA-256 hashed. This is what keeps a hot reload from
+    hashing hundreds of MB of unchanged runtime DLLs (oneMKL is ~520 MB) on TouchDesigner's main thread.
+    """
+    try:
+        sa, sb = os.stat(a), os.stat(b)
+    except OSError:
+        return False
+    if sa.st_size != sb.st_size:
+        return False
+    # Equal stamps prove nothing for a file written moments ago: NTFS stamps come from a coarse clock
+    # (up to ~16 ms), so two quick writes of equal size can share one. Only trust the stamp for files
+    # older than 2 s - exactly the large, rarely-changing runtime DLLs the fast path is for.
+    if sa.st_mtime_ns == sb.st_mtime_ns and (time.time_ns() - sa.st_mtime_ns) > 2_000_000_000:
+        return True
+    try:
+        return file_sha256(a) == file_sha256(b)
+    except OSError:
+        return False
+
+
+def read_runtime_dll_manifest(build_dir, plugin_name):
+    """Runtime DLL file names recorded by TDPlugin.cmake's td_plugin_add_runtime_dll, or None.
+
+    CMake writes build/<name>_runtime_dlls.txt (one file name per line). When present, PluginBuilder
+    stages exactly these next to the plugin instead of every *.dll found in build/bin/<Config>/ (which
+    also picks up anything a user dropped there by hand, e.g. a 520 MB oneMKL runtime for a bench).
+    """
+    path = os.path.join(build_dir, f'{plugin_name}_runtime_dlls.txt')
+    if not os.path.exists(path):
+        return None
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        names = [ln.strip() for ln in f if ln.strip()]
+    seen, out = set(), []
+    for n in names:
+        if n.lower() not in seen:
+            seen.add(n.lower())
+            out.append(n)
+    return out
+
+
+def coalesce_output(lines, max_lines=200):
+    """Join queued output lines into one printable block, capped at max_lines.
+
+    Returns (text, dropped). Printing to the TouchDesigner textport is not free, and a build can emit
+    hundreds of lines in one frame; one print per frame with a cap keeps the main thread responsive.
+    The full output stays in BuildJob.output (and the parsed diagnostics in the build_errors DAT).
+    """
+    lines = [ln if ln.endswith('\n') else ln + '\n' for ln in lines]
+    if len(lines) <= max_lines:
+        return ''.join(lines), 0
+    head = lines[:max_lines]
+    dropped = len(lines) - max_lines
+    return ''.join(head) + f'  ... {dropped} more line(s) this frame (full log in the job output)\n', dropped
+
+
+def _free_old_slot(dst):
+    """Return a path dst.old / dst.old1..old50 that does not exist (removing unlocked leftovers).
+
+    A previous incarnation that is still mapped by TouchDesigner cannot be deleted, only left alone, so
+    the first slot that is free (or can be freed) wins. Raises OSError if all 51 slots are locked.
+    """
+    base = dst + '.old'
+    for i in range(0, 51):
+        cand = base if i == 0 else f'{base}{i}'
+        if not os.path.exists(cand):
+            return cand
+        try:
+            os.remove(cand)
+            return cand
+        except OSError:
+            continue
+    raise OSError(f'no free .old slot next to {dst} (51 previous versions still mapped)')
+
+
 def safe_replace_file(src, dst, keep_old=True):
     """
     Replace dst with src using the Windows rename-in-place trick.
 
     A DLL loaded by TouchDesigner can't be overwritten or deleted, but it *can* be renamed. So the
-    existing dst is renamed to dst + '.old' (a previous .old is removed first if possible), then
+    existing dst is renamed to dst + '.old' (a previous .old is removed first if possible), then the
     src is copied to dst. Returns (changed: bool, note: str).
+
+    Hash gate first: identical content short-circuits with (False, 'unchanged') so hot-reload
+    does not thrash the loader. If a previous .old is still mapped, falls back to .old1..old50.
+    The standalone build path uses the same idea in cmake/TDDeploy.cmake.
+    Callers: PluginBuilderExt._do_copy_plugin / install_plugin, tests FileTests.
     """
     if not os.path.exists(src):
         raise FileNotFoundError(src)
     os.makedirs(os.path.dirname(dst) or '.', exist_ok=True)
     if os.path.exists(dst):
-        try:
-            if file_sha256(src) == file_sha256(dst):
-                return False, 'unchanged'
-        except OSError:
-            pass
-        old = dst + '.old'
-        if os.path.exists(old):
-            try:
-                os.remove(old)
-            except OSError:
-                # still mapped by a previous incarnation; use a numbered fallback
-                i = 1
-                while os.path.exists(f'{old}{i}') and i < 50:
-                    try:
-                        os.remove(f'{old}{i}')
-                    except OSError:
-                        i += 1
-                        continue
-                    break
-                old = f'{old}{i}'
+        same = files_identical(src, dst)
+        if same:
+            return False, 'unchanged'
+        old = _free_old_slot(dst)
         os.replace(dst, old)
-        note = 'replaced (previous renamed to .old)'
+        note = 'replaced (previous renamed to ' + os.path.basename(old)[len(os.path.basename(dst)):] + ')'
     else:
+        old = None
         note = 'new'
     shutil.copy2(src, dst)
-    if not keep_old:
+    if not keep_old and old:
         try:
-            os.remove(dst + '.old')
+            os.remove(old)
         except OSError:
             pass
     return True, note
@@ -516,7 +750,13 @@ def _api_from_header(path):
 
 
 def read_sdk_versions(include_dir):
-    """API versions of the headers PluginBuilder compiles against."""
+    """API versions of the headers PluginBuilder compiles against.
+
+    Reads <include_dir>/<FAMILY>_CPlusPlusBase.h for `<Family>CPlusPlusAPIVersion`
+    and CPlusPlus_Common.h for OP_CommonAPIVersion. Current baseline: API 10 family
+    headers, Common = 2 (tests/test_core.py:SdkTests asserts CHOP >= 10).
+    Compared against the running TD by PluginBuilderExt._check_sdk_versions.
+    """
     versions = {}
     for fam in FAMILIES:
         (f, v), _ = _api_from_header(os.path.join(include_dir, f'{fam}_CPlusPlusBase.h'))
@@ -528,7 +768,12 @@ def read_sdk_versions(include_dir):
 
 
 def installed_sdk_versions(td_samples_dir):
-    """API versions shipped by the running TouchDesigner (Samples/CPlusPlus)."""
+    """API versions shipped by the running TouchDesigner (Samples/CPlusPlus).
+
+    Layout differs from include/: SOP headers live under SimpleShapesSOP/, TOP under
+    CudaTOP/, POP under SimpleShapesPOP/. Written by dev/sync_templates.py:sync_headers
+    into include/sdk_versions.json as well.
+    """
     versions = {}
     layout = {'CHOP': 'CHOP', 'DAT': 'DAT', 'SOP': 'SimpleShapesSOP', 'TOP': 'CudaTOP', 'POP': 'SimpleShapesPOP'}
     for fam, sub in layout.items():
@@ -538,6 +783,42 @@ def installed_sdk_versions(td_samples_dir):
     _, common = _api_from_header(os.path.join(td_samples_dir, 'CHOP', 'CPlusPlus_Common.h'))
     versions['Common'] = common
     return versions
+
+
+_RX_TD_DIR = re.compile(r'^TouchDesigner(?:[ ._-]?(\d{4})\.(\d+))?$', re.IGNORECASE)
+
+
+def find_td_installs(search_roots=None):
+    """Return installed TouchDesigner folders, newest build first: [(build_tuple, path), ...].
+
+    TouchDesigner 2025+ installs into versioned folders (``TouchDesigner.2025.33230``); older
+    installs used an unversioned ``TouchDesigner`` folder, which sorts last (build (0, 0)).
+    Only folders that contain ``Samples/CPlusPlus`` count. Used by dev/sync_templates.py and as the
+    TD_SAMPLES_DIR fallback so nothing hard-codes a path that a TD upgrade removes.
+    """
+    if search_roots is None:
+        search_roots = []
+        for env in ('ProgramFiles', 'ProgramW6432', 'ProgramFiles(x86)'):
+            base = os.environ.get(env)
+            if base:
+                search_roots.append(os.path.join(base, 'Derivative'))
+    found = {}
+    for root in search_roots:
+        if not root or not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            m = _RX_TD_DIR.match(name)
+            path = os.path.join(root, name)
+            if not m or not os.path.isdir(os.path.join(path, 'Samples', 'CPlusPlus')):
+                continue
+            build = (int(m.group(1)), int(m.group(2))) if m.group(1) else (0, 0)
+            found[os.path.normcase(os.path.abspath(path))] = (build, path)
+    return sorted(found.values(), key=lambda t: t[0], reverse=True)
+
+
+def td_build_label(build):
+    """(2025, 33230) -> '2025.33230'; (0, 0) -> 'unversioned'."""
+    return f'{build[0]}.{build[1]}' if build and build[0] else 'unversioned'
 
 
 def sdk_mismatch_message(ours, installed):
@@ -576,7 +857,9 @@ BUILTIN_LOADER_PARS = frozenset({
     'pageindex', 'renamefrom', 'renameto', 'callbacks', 'language',
 })
 
-# Pulsable/structural pars whose value must never be snapshotted/restored by the reload machinery.
+# Pulsable/structural pars whose value must never be snapshotted/restored by the reload
+# machinery. Driving these during a reload would immediately re-trigger unload/reinit or
+# rename pages out from under the mirror (see PluginBuilderExt._reload_loader_fresh).
 LOADER_PARS_RELOAD_CONTROL = frozenset({
     'plugin', 'unloadplugin', 'reinit', 'reinitpulse',
     'callbacks', 'language', 'commonrenamefrom', 'commonrenameto', 'pageindex',
@@ -584,6 +867,7 @@ LOADER_PARS_RELOAD_CONTROL = frozenset({
 })
 
 # Mode sentinels exchanged with PluginBuilderExt so the Core never imports td.ParMode.
+# Ext resolves the real enum once via _par_mode() and passes it to normalize_par_mode.
 PAR_CONSTANT, PAR_EXPRESSION, PAR_BIND = 'CONSTANT', 'EXPRESSION', 'BIND'
 
 
@@ -656,7 +940,10 @@ def parameter_definition_diff(before, after):
 
 def dedupe_consecutive(items):
     """Yield items with immediately-repeated duplicates collapsed (msvc repeats whole warning blocks
-    verbatim across translation units). Order otherwise preserved."""
+    verbatim across translation units). Order otherwise preserved.
+
+    Applied to rendered diagnostic strings in PluginBuilderExt.compile_plugin before printing.
+    """
     prev = _SENTINEL = object()
     for item in items:
         if item != prev:
@@ -669,6 +956,12 @@ def dedupe_consecutive(items):
 # =================================================================================================
 
 def render_vscode_files(plugin_name, td_exe, toe_path, project_folder, sdk_include_dir, extra_includes=()):
+    """Build .vscode/{launch,c_cpp_properties,settings}.json dicts for a new project.
+
+    Attach-to-process + Launch TouchDesigner configs (cppvsdbg), compile_commands.json
+    from the Ninja build dir, C++17 / windows-msvc-x64, *.cu/*.cuh as C++.
+    Written by PluginBuilderExt._write_vscode_files; covered by VscodeTests.test_render.
+    """
     launch = {
         "version": "0.2.0",
         "configurations": [
@@ -717,8 +1010,8 @@ def render_vscode_files(plugin_name, td_exe, toe_path, project_folder, sdk_inclu
 #  Build execution
 # =================================================================================================
 
-CREATE_NO_WINDOW = 0x08000000
-
+# CREATE_NO_WINDOW is also defined earlier near _run_quiet; kept here so the build
+# section reads as one unit (same value, harmless duplicate at class scope).
 
 class WindowsJobObject:
     """Kill-on-close job object so cmake/ninja/cl children die with the runner (Windows only, best effort)."""
@@ -785,13 +1078,26 @@ class WindowsJobObject:
 
 
 class BuildJob:
+    """One unit of work for BuildRunner (configure / build / clean / test / custom).
+
+    on_done runs on the main thread inside BuildRunner.poll — never from the worker —
+    so TouchDesigner callbacks can safely touch ops/params. returncode 0 and not
+    cancelled => ok; duration_ms is wall time between start and finish.
+    """
     _next_id = 1
 
-    def __init__(self, kind, args, cwd, label='', on_done=None, env_extra=None):
+    def __init__(self, kind, args, cwd, label='', on_done=None, env_extra=None, func=None):
         self.id = BuildJob._next_id
         BuildJob._next_id += 1
-        self.kind = kind            # 'configure' | 'build' | 'clean' | 'test' | 'custom'
+        self.kind = kind            # 'configure' | 'build' | 'clean' | 'test' | 'custom' | 'call'
         self.args = list(args)
+        # In-process work (kind 'call'): func(job, emit) runs on the runner thread instead of a
+        # subprocess. emit(text) streams a line like a child's stdout; the return value (None/int) is
+        # the returncode; anything the caller needs back goes into job.result. Used for file work that
+        # must not run on TouchDesigner's main thread (DLL hashing/staging, installs).
+        self.func = func
+        self.result = None
+        self.error = None
         self.cwd = cwd
         self.label = label or kind
         self.on_done = on_done
@@ -824,6 +1130,11 @@ class BuildRunner:
         ...each frame:  for ev in runner.poll(): ...     # dispatches on_done on the calling thread
 
     Events from poll(): ('env', ok, message) | ('line', job, text) | ('start', job) | ('done', job)
+
+    Shutdown contract: set _stop, cancel pending, kill current, push sentinel None,
+    join with timeout, then close the WindowsJobObject (KILL_ON_JOB_CLOSE reaps any
+    leftover cmake/ninja/cl children). PluginBuilderExt polls via a one-frame
+    run() loop (_schedule_poll / _poll).
     """
 
     def __init__(self, env_factory, capture_output=True, use_job_object=True, log=None):
@@ -843,6 +1154,7 @@ class BuildRunner:
         self._job_obj = WindowsJobObject() if use_job_object else None
         self._lock = threading.Lock()
         self.pending_count = 0
+        self._pending = []          # submitted, not yet started (for pending_kinds); guarded by _lock
 
     # ---- lifecycle ------------------------------------------------------------------------
     def start(self):
@@ -887,8 +1199,14 @@ class BuildRunner:
     def submit(self, job):
         with self._lock:
             self.pending_count += 1
+            self._pending.append(job)
         self._jobs.put(job)
         return job
+
+    def pending_kinds(self):
+        """Kinds of the jobs queued but not started yet, oldest first (e.g. ['configure', 'build'])."""
+        with self._lock:
+            return [j.kind for j in self._pending]
 
     def cancel_pending(self):
         n = 0
@@ -904,6 +1222,7 @@ class BuildRunner:
             pass
         with self._lock:
             self.pending_count = 0
+            self._pending.clear()
         return n
 
     def kill_current(self):
@@ -951,6 +1270,8 @@ class BuildRunner:
                 break
             with self._lock:
                 self.pending_count = max(0, self.pending_count - 1)
+                if job in self._pending:
+                    self._pending.remove(job)
             if job.cancelled:
                 continue
             self._run_job(job)
@@ -959,6 +1280,23 @@ class BuildRunner:
         self._current = job
         job.started = time.perf_counter()
         self._events.put(('start', job))
+        if job.func is not None:
+            def emit(text):
+                line = text if text.endswith('\n') else text + '\n'
+                job.output.append(line)
+                self._events.put(('line', job, line))
+            try:
+                rc = job.func(job, emit)
+                job.returncode = 0 if rc is None else int(rc)
+            except Exception as e:  # noqa: BLE001
+                job.error = e
+                job.returncode = -1
+                emit(f'[BuildRunner] {job.label} failed: {e}')
+            finally:
+                job.finished = time.perf_counter()
+                self._current = None
+                self._events.put(('done', job))
+            return
         env = dict(self._env)
         env.update({k: str(v) for k, v in job.env_extra.items()})
         try:

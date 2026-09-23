@@ -45,6 +45,8 @@
 extern "C"
 {
 
+// Called once when the DLL is loaded: API version, execute mode (CPUMem here),
+// operator metadata (filled in when the plugin is generated) and input counts.
 DLLEXPORT
 void
 FillTOPPluginInfo(TOP_PluginInfo *info)
@@ -104,6 +106,8 @@ DestroyTOPInstance(TOP_CPlusPlusBase* instance, TOP_Context *context)
 
 CPUMemoryTOP::CPUMemoryTOP(const OP_NodeInfo* info, TOP_Context* context) :
 	myNodeInfo(info),
+	myStep(0.0),
+	mySpeed(0.0),
 	myThread(nullptr),
 	myThreadShouldExit(false),
 	myStartWork(false),
@@ -111,7 +115,6 @@ CPUMemoryTOP::CPUMemoryTOP(const OP_NodeInfo* info, TOP_Context* context) :
 	myFrameQueue(context)
 {
 	myExecuteCount = 0;
-	myStep = 0.0;
 	myBrightness = 1.0;
 }
 
@@ -122,7 +125,7 @@ CPUMemoryTOP::~CPUMemoryTOP()
 	{
 		myThreadShouldExit.store(true);
 		// Incase the thread is sleeping waiting for a signal
-		// to create more work, wake it up
+		// to create more work, wake it up (harmless in free-running mode)
 		startMoreWork();
 		if (myThread->joinable())
 		{
@@ -140,37 +143,34 @@ CPUMemoryTOP::getGeneralInfo(TOP_GeneralInfo* ginfo, const OP_Inputs* inputs, vo
 	ginfo->cookEveryFrameIfAsked = true;
 }
 
+// Cook. Default mode: fill a 256x256 RGBA32Float buffer on the main thread and
+// upload it; if a TOP is connected, its previous frame's download is uploaded to
+// color buffer 3. THREADING_EXAMPLE mode: a producer thread fills buffers and
+// execute() uploads the newest completed one.
 void
 CPUMemoryTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void* reserved1)
 {
 	myExecuteCount++;
 
-
-#ifdef THREADING_EXAMPLE
-	mySettingsLock.lock();
-#endif
-
 	double speed = inputs->getParDouble("Speed");
-	mySpeed = speed;
+	double brightness = inputs->getParDouble("Brightness");
 
-	myBrightness = inputs->getParDouble("Brightness");
+	{
+		// The producer thread (THREADING_EXAMPLE) reads these under the same lock.
+		// Parameters are read before taking it so the lock is held only briefly.
+		std::lock_guard<std::mutex> lock(mySettingsLock);
+		mySpeed = speed;
+		myBrightness = brightness;
+	}
 
 	// See comments at the top of this file to information about the threading
 	// example mode for this project.
 #ifdef THREADING_EXAMPLE
-	mySettingsLock.unlock();
-
 	if (!myThread)
 	{
 		myThread = new std::thread(
 			[this]()
 			{
-				std::random_device rd;
-				std::mt19937 mt(rd());
-
-				// We are going to generate new frame data at irregular interval
-				std::uniform_real_distribution<double> dist(10.0, 40.0);
-
 				// Exit when our owner tells us to
 				while (!this->myThreadShouldExit)
 				{
@@ -196,12 +196,17 @@ CPUMemoryTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void* reserve
 					// If there is a buffer to update
 					if (buf)
 					{
-						this->mySettingsLock.lock();
-						myStep += mySpeed;
-						double brightness = myBrightness;
-						this->mySettingsLock.unlock();
+						// Take a local copy of the settings: the official sample passed
+						// the shared myStep to fillBuffer outside the lock (data race).
+						double step, brightness;
+						{
+							std::lock_guard<std::mutex> lock(this->mySettingsLock);
+							step = myStep.load() + mySpeed;
+							myStep.store(step);
+							brightness = myBrightness;
+						}
 
-						CPUMemoryTOP::fillBuffer(buf, 0, info.textureDesc.width, info.textureDesc.height, myStep, brightness);
+						CPUMemoryTOP::fillBuffer(buf, 0, info.textureDesc.width, info.textureDesc.height, step, brightness);
 
 						BufferInfo bufInfo;
 						bufInfo.buf = buf;
@@ -213,16 +218,20 @@ CPUMemoryTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void* reserve
 					auto end = std::chrono::steady_clock::now();
 					auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count();
 
-					// Sleep for a 15.5ms. We want our loops to be 16.666ms, so this give some wiggle wrong.
-					// In almost all cases we wouldn't be manually sleeping, but instead sleeping
-					// using a function from the SDK of the device that we are reading.
-					std::this_thread::sleep_for(std::chrono::microseconds(15500 - duration));
+					// This sleep stands in for an external device delivering frames
+					// at its own rate (~64 fps here). It is NOT tied to TouchDesigner's
+					// frame rate: execute() simply takes the newest frame available.
+					// A real device would block in its SDK's wait/read call instead.
+					// To produce exactly one frame per cook, use
+					// THREADING_SIGNALED_PRODUCER rather than tuning this value.
+					if (duration < 15500)
+						std::this_thread::sleep_for(std::chrono::microseconds(15500 - duration));
 #endif
 				}
 			});
 	}
 
-	// Tries to assign a buffer to be uploaded to the TOP
+	// Uploads the newest completed frame, if any (older ones are dropped)
 	BufferInfo bufInfo = myFrameQueue.getBufferToUpload();
 
 	if (bufInfo.buf)
@@ -273,12 +282,20 @@ CPUMemoryTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void* reserve
 				info.colorBufferIndex = 3;
 				OP_SmartRef<TOP_Buffer> buf = myContext->createOutputBuffer(myPrevDownRes->size, TOP_BufferFlags::None, nullptr);
 
-				memcpy(buf->data, myPrevDownRes->getData(), myPrevDownRes->size);
-
-				output->uploadBuffer(&buf, info, nullptr);
+				const void* src = myPrevDownRes->getData();
+				if (buf && src)
+				{
+					memcpy(buf->data, src, myPrevDownRes->size);
+					output->uploadBuffer(&buf, info, nullptr);
+				}
 			}
 			myPrevDownRes = std::move(downRes);
 		}
+	}
+	else
+	{
+		// Don't show a stale frame if an input gets connected again later.
+		myPrevDownRes.release();
 	}
 #endif
 }
@@ -304,12 +321,16 @@ CPUMemoryTOP::fillAndUpload(TOP_Output* output, double speed, int width, int hei
 	uint64_t layerBytes = uint64_t(info.textureDesc.width) * info.textureDesc.height * 4 * sizeof(float);
 	uint64_t byteSize = layerBytes * numLayers;
 	OP_SmartRef<TOP_Buffer> buf = myContext->createOutputBuffer(byteSize, TOP_BufferFlags::None, nullptr);
+	if (!buf)
+		return;
 
 	uint64_t byteOffset = 0;
 	for (int i = 0; i < numLayers; i++)
 	{
-		myStep += speed;
-		fillBuffer(buf, byteOffset, info.textureDesc.width, info.textureDesc.height, myStep, myBrightness);
+		// Only the main thread touches myStep in this (non-threaded) mode.
+		double step = myStep.load() + speed;
+		myStep.store(step);
+		fillBuffer(buf, byteOffset, info.textureDesc.width, info.textureDesc.height, step, myBrightness);
 		byteOffset += layerBytes;
 	}
 
@@ -372,7 +393,7 @@ int32_t
 CPUMemoryTOP::getNumInfoCHOPChans(void *reserved1)
 {
 	// We return the number of channel we want to output to any Info CHOP
-	// connected to the TOP. In this example we are just going to send one channel.
+	// connected to the TOP. In this example we send two channels.
 	return 2;
 }
 
@@ -380,7 +401,7 @@ void
 CPUMemoryTOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void* reserved1)
 {
 	// This function will be called once for each channel we said we'd want to return
-	// In this example it'll only be called once.
+	// (twice in this example).
 
 	if (index == 0)
 	{
@@ -391,7 +412,7 @@ CPUMemoryTOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void* reserv
 	if (index == 1)
 	{
 		chan->name->setString("step");
-		chan->value = (float)myStep;
+		chan->value = (float)myStep.load();
 	}
 }
 
@@ -443,9 +464,9 @@ CPUMemoryTOP::getInfoDATEntries(int32_t index,
 		entries->values[0]->setString(tempBuffer);
 
 #ifdef _WIN32
-		sprintf_s(tempBuffer, "%g", myStep);
+		sprintf_s(tempBuffer, "%g", myStep.load());
 #else // macOS
-		snprintf(tempBuffer, sizeof(tempBuffer), "%g", myStep);
+		snprintf(tempBuffer, sizeof(tempBuffer), "%g", myStep.load());
 #endif
 		entries->values[1]->setString(tempBuffer);
 	}
@@ -507,7 +528,9 @@ CPUMemoryTOP::pulsePressed(const char* name, void *reserved1)
 {
 	if (!strcmp(name, "Reset"))
 	{
-		myStep = 0.0;
+		// Under the settings lock so a producer increment can't overwrite the reset.
+		std::lock_guard<std::mutex> lock(mySettingsLock);
+		myStep.store(0.0);
 	}
 
 

@@ -1,9 +1,17 @@
-# PluginBuilder_V2 — Architecture & Audit (current state, 2026-08-26)
+# PluginBuilder_V2 — Architecture & Audit (refreshed 2026-09-22; baseline 2026-08-26 / v2.1.0)
 
 > Scope: what the repository actually contains and does today, verified by the headless test suite
 > (`python -m unittest discover -s tests`) and the integration script (`python dev/ci.py --all`),
 > both of which pass on Windows 11 / VS 18 (MSVC 19.51) / TouchDesigner 2025.33070.
 > Historic claims that turned out to be wrong are listed at the end so they are not repeated.
+>
+> **Updates since the 2026-08-26 baseline (v2.1.0):** the test count is now **29** (was 23 at
+> 2.1.0; 2.1.3 added six pure tests for parameter persistence + diagnostic dedupe).
+> Releases **2.1.1–2.1.4** landed after the original audit: fresh-loader recreation so parameter
+> *definitions* refresh on hot-reload (2.1.1), built-in-par persistence + DLL-map rollback (2.1.2),
+> build-queue guard fix + `dedupe_consecutive` (2.1.3), and `Header`/`Header2` exclusion from
+> bind/persistence (2.1.4). See `CHANGELOG.md`. The sibling **Plugin_FFT** project is the
+> real-world consumer exercised by `dev/ci.py --project` (see §6).
 
 ## 1. Layout
 
@@ -19,11 +27,14 @@ PluginBuilder_V2/
 │   ├── CMakeBlocks.py          # generator for the 15-line per-project CMakeLists.txt
 │   ├── CMakePresets.json / launch.vs.json
 ├── templates/<Name>/{template.json, source/}   # 8 templates incl. SimpleShapesPOP & CudaPOP
-├── tests/test_core.py          # 23 unit tests
+├── tests/test_core.py          # 29 unit tests (was 23 at v2.1.0; +6 in 2.1.3)
 ├── dev/{ci.py, sync_templates.py, deploy.py, settings_template.ini, dev.toe}
 ├── 3rdParty/{opencv, Python}   # vendored headers/import libs (also found in <TD>/Samples/CPlusPlus/3rdParty)
 ├── PluginBuilder.tox, SetSettings.toe, README.md, CHANGELOG.md, LICENSE
 ```
+
+Sibling consumer (outside this tree): `../Plugin_FFT/PluginProjects/FFT` — a full FFT CHOP built
+with this module; used as the cross-repo build target by `dev/ci.py --project`.
 
 ## 2. Data flow
 
@@ -65,3 +76,17 @@ Loader        ─▶ sync_custom_parameters: signature ─▶ pages mirrored on 
 | `-DPLUGIN_BUILDER_DIR` makes projects relocatable | It was overridden by `CACHE … FORCE` in the generated file. Now honoured. |
 | Debounced copy "ensures a single copy of the final linked DLL" | It unloaded the plugin before checking locks and copied unchanged DLLs. Now hash-gated, rename-in-place. |
 | `file_locked()` detects a DLL in use | Opening for read succeeds on a mapped DLL. Now tests write access. |
+
+## 6. Relationship to `../Plugin_FFT` (joint contract)
+
+| Shared piece | PluginBuilder side | Plugin_FFT side |
+|---|---|---|
+| CMake module | `cmake/TDPlugin.cmake` (`td_add_plugin`, `td_plugin_use_fftw3`, `td_plugin_optimize`) | `PluginProjects/FFT/CMakeLists.txt` includes it via `PLUGIN_BUILDER_DIR` (default `../../../PluginBuilder_V2`, overridable with `-D`) |
+| Manifest | `plugin.json` schema + reopen-by-name workflow | `plugin.json`: family CHOP, optype `Fftcustom`, deps fftw3/mkl |
+| Deploy | in-TD rename-in-place + fresh-loader recreate (2.1.x) | `__Plugins__/FFT/{FFT.dll,libfftw3f-*.dll}` consumed by the loader |
+| SDK headers | `include/` + `dev/sync_templates.py` | same headers (API 10) through the module |
+| CI | `dev/ci.py --all` (templates) | `dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT` |
+| Hot-reload fixes | 2.1.1 parameter-definition refresh, hash-gated swap | discovered while iterating on FFT's menu entries live |
+
+Run **both** CI lines before accepting changes to `cmake/`, `source/PluginBuilderExt.py`
+(loader / parameter mirroring), `plugin.json` handling, or `include/`.

@@ -27,6 +27,8 @@
 extern "C"
 {
 
+// Called once when the DLL is loaded: API version, operator metadata (filled in
+// when the plugin is generated) and the allowed number of inputs.
 DLLEXPORT
 void
 FillDATPluginInfo(DAT_PluginInfo *info)
@@ -98,7 +100,8 @@ BasicDAT::~BasicDAT()
 void
 BasicDAT::getGeneralInfo(DAT_GeneralInfo* ginfo, const OP_Inputs* inputs, void* reserved1)
 {
-	// This will cause the node to cook every frame
+	// Set this to true to cook every frame (when asked); false cooks only
+	// when an input or parameter changes.
 	ginfo->cookEveryFrameIfAsked = false;
 }
 
@@ -132,6 +135,10 @@ BasicDAT::makeText(DAT_Output* output)
 	output->setText("This is some test data.");
 }
 
+// Cook. With an input connected, the input DAT (text or table) is copied
+// through. Without one, a table or text is generated from Rows/Cols/Outputtype
+// and, for a table, one row per channel of the Chop parameter is appended
+// (channel name, first sample).
 void
 BasicDAT::execute(DAT_Output* output,
 							const OP_Inputs* inputs,
@@ -149,6 +156,11 @@ BasicDAT::execute(DAT_Output* output,
 		inputs->enablePar("Outputtype", 0);	// not used
 
 		const OP_DATInput	*cinput = inputs->getInputDAT(0);
+		if (!cinput)
+			return;
+
+		// Shown in the Info DAT.
+		myDat = cinput->opPath ? cinput->opPath : "";
 
 		int numRows = cinput->numRows;
 		int numCols = cinput->numCols;
@@ -156,8 +168,11 @@ BasicDAT::execute(DAT_Output* output,
 
 		if (!isTable) // is Text
 		{
-			const char* str = cinput->getCell(0, 0);
-			output->setText(str);
+			// A text DAT stores its whole text in cell (0,0). Set the output type
+			// explicitly: it may still be Table from a previous cook.
+			const char* str = (cinput->numRows > 0 && cinput->numCols > 0) ? cinput->getCell(0, 0) : "";
+			output->setOutputDataType(DAT_OutDataType::Text);
+			output->setText(str ? str : "");
 		}
 		else
 		{
@@ -185,6 +200,13 @@ BasicDAT::execute(DAT_Output* output,
 		int	 numRows = inputs->getParInt("Rows");
 		int	 numCols = inputs->getParInt("Cols");
 
+		// The parameters are not clamped: a negative size would make the row
+		// indices used for the Chop rows below negative.
+		if (numRows < 0)
+			numRows = 0;
+		if (numCols < 0)
+			numCols = 0;
+
 		switch (outputDataType)
 		{
 			case 0:		// Table
@@ -200,18 +222,30 @@ BasicDAT::execute(DAT_Output* output,
 				break;
 		}
 
-		// if there is an input chop parameter:
+		// if there is an input chop parameter, append one row per channel.
+		// Only a Table output has rows (setTableSize is not valid for Text), and
+		// a channel needs at least one sample to be read.
 		const OP_CHOPInput	*cinput = inputs->getParCHOP("Chop");
-		if (cinput)
+		if (cinput && cinput->numChannels > 0 && cinput->numSamples > 0 &&
+			output->getOutputDataType() == DAT_OutDataType::Table)
 		{
-			int numSamples = cinput->numSamples;
-			int ind = 0;
+			const int ind = 0;
+			myChop = inputs->getParString("Chop");
+
+			// The name and value go in columns 0 and 1, so we need at least 2.
+			if (numCols < 2)
+				numCols = 2;
+
+			// Resize once instead of once per channel.
+			output->setTableSize(numRows + cinput->numChannels, numCols);
+
 			for (int i = 0; i < cinput->numChannels; i++)
 			{
 				myChopChanName = std::string(cinput->getChannelName(i));
-				myChop = inputs->getParString("Chop");
 
-				static char tempBuffer[50];
+				// Local buffer: a function-static one would be shared by every
+				// instance of this DAT.
+				char tempBuffer[50];
 				myChopChanVal = float(cinput->getChannelData(i)[ind]);
 
 #ifdef _WIN32
@@ -219,11 +253,8 @@ BasicDAT::execute(DAT_Output* output,
 #else // macOS
 				snprintf(tempBuffer, sizeof(tempBuffer), "%g", myChopChanVal);
 #endif
-				if (numCols == 0)
-					numCols = 2;
-				output->setTableSize(numRows + i + 1, numCols);
 				output->setCellString(numRows + i, 0, myChopChanName.c_str());
-				output->setCellString(numRows + i, 1, &tempBuffer[0]);
+				output->setCellString(numRows + i, 1, tempBuffer);
 			}
 
 		}
@@ -235,7 +266,7 @@ int32_t
 BasicDAT::getNumInfoCHOPChans(void* reserved1)
 {
 	// We return the number of channel we want to output to any Info CHOP
-	// connected to the CHOP. In this example we are just going to send one channel.
+	// connected to the DAT. In this example we send four channels.
 	return 4;
 }
 
@@ -244,7 +275,7 @@ BasicDAT::getInfoCHOPChan(int32_t index,
 									OP_InfoCHOPChan* chan, void* reserved1)
 {
 	// This function will be called once for each channel we said we'd want to return
-	// In this example it'll only be called once.
+	// (four times in this example).
 
 	if (index == 0)
 	{
@@ -274,8 +305,9 @@ BasicDAT::getInfoCHOPChan(int32_t index,
 bool
 BasicDAT::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1)
 {
+	// 3 rows of (name, value): only 2 columns are filled below.
 	infoSize->rows = 3;
-	infoSize->cols = 3;
+	infoSize->cols = 2;
 	// Setting this to false means we'll be assigning values to the table
 	// one row at a time. True means we'll do it one column at a time.
 	infoSize->byColumn = false;
@@ -331,20 +363,12 @@ BasicDAT::getInfoDATEntries(int32_t index,
 	if (index == 2)
 	{
 		// Set the value for the first column
-#ifdef _WIN32
-		strcpy_s(tempBuffer, "DAT input name");
-#else // macOS
-		strlcpy(tempBuffer, "offset", sizeof(tempBuffer));
-#endif
-		entries->values[0]->setString(tempBuffer);
+		entries->values[0]->setString("DAT input name");
 
-		// Set the value for the second column
-#ifdef _WIN32
-		strcpy_s(tempBuffer, myDat.c_str());
-#else // macOS
-		snprintf(tempBuffer, sizeof(tempBuffer), "%g", myOffset);
-#endif
-		entries->values[1]->setString(tempBuffer);
+		// Set the value for the second column (the path of the input DAT; the
+		// official sample printed the offset here on macOS). setString copies the
+		// string, so no intermediate buffer is needed.
+		entries->values[1]->setString(myDat.c_str());
 	}
 }
 

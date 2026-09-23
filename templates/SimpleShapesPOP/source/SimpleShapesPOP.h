@@ -19,10 +19,14 @@
 using namespace TD;
 
 // To get more help about these functions, look at POP_CPlusPlusBase.h
+// One instance per POP node. execute() either passes the input through (via a
+// CPU download) or fills new CPU buffers from myContext->createBuffer() with a
+// generated shape and assigns them to the POP_Output.
 class SimpleShapesPOP : public POP_CPlusPlusBase
 {
 public:
 
+	// myContext is kept to create the output buffers.
 	SimpleShapesPOP(const OP_NodeInfo* info, POP_Context* context);
 
 	virtual ~SimpleShapesPOP();

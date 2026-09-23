@@ -24,16 +24,22 @@
 #      TD_PLUGIN_WARNINGS      OFF|ON  (ON = /W4 /permissive-)   default OFF
 #      TD_PLUGIN_ASAN          OFF|ON  (Debug only, /fsanitize=address) default OFF
 #
-#  Functions:
+#      Functions:
 #      td_add_plugin(<name> FAMILY <CHOP|TOP|DAT|SOP|POP> [SOURCES_DIR <dir>] [FEATURES <cuda|python|opencv>...])
-#      td_plugin_optimize(<name> [AVX2] [AVX512] [FAST_MATH] [LTO])
+#      td_plugin_optimize(<name> [REALTIME] [AVX2] [AVX512] [FAST_MATH] [LTO])
 #      td_plugin_add_runtime_dll(<name> <dll-path>...)
 #      td_plugin_use_fftw3(<name> [ROOT <dir>] [PRECISION f|d] [VERSION <tag>])
 #      td_plugin_use_cuda(<name>)
 #      td_plugin_use_python(<name>)
 #      td_plugin_use_opencv(<name> [COMPONENTS ...])
 #      td_plugin_add_test(<name> <test-target> SOURCES <files>... [LINK <libs>...])
-#      td_plugin_add_bench(<name> <bench-target> SOURCES <files>... [LINK <libs>...])
+#      td_plugin_add_bench(<name> <bench-target> SOURCES <files>... [LINK <libs>...] [GATE <baseline.json> [GATE_ARGS ...]])
+#      TD_PLUGIN_CXX_STANDARD  17|20 (default 17)
+#
+#  Consumers: every generated project (CMakeBlocks.BODY includes this file), dev/ci.py
+#  scaffolds, and the sibling repo ../Plugin_FFT (FFTW3 DYNAMIC contract, headless tests).
+#  Toolchain assumed: CMake >= 3.21 + Ninja + MSVC (vcvarsall captured by
+#  PluginBuilderCore.capture_vc_env). SDK headers are API 10 (include/sdk_versions.json).
 # ===========================================================================================
 
 include_guard(GLOBAL)
@@ -41,6 +47,9 @@ cmake_minimum_required(VERSION 3.21)
 
 # ---------------------------------------------------------------------------------------------
 # Resolve PLUGIN_BUILDER_DIR (caller -D > env > location of this file)
+# Priority matches generated CMakeLists (CMakeBlocks.BODY): an explicit -D wins, then
+# the PLUGIN_BUILDER_DIR environment variable (exported by PluginBuilder builds), then
+# the directory of this file (works when the repo layout is intact).
 # ---------------------------------------------------------------------------------------------
 if(NOT PLUGIN_BUILDER_DIR)
     if(DEFINED ENV{PLUGIN_BUILDER_DIR})
@@ -60,12 +69,44 @@ set(TD_SDK_INCLUDE_DIR "${TD_SDK_INCLUDE_DIR}" CACHE PATH "TouchDesigner C++ SDK
 if(NOT TD_SAMPLES_DIR AND DEFINED ENV{TD_SAMPLES_DIR})
     set(TD_SAMPLES_DIR "$ENV{TD_SAMPLES_DIR}")
 endif()
-if(NOT TD_SAMPLES_DIR AND EXISTS "C:/Program Files/Derivative/TouchDesigner/Samples/CPlusPlus")
-    set(TD_SAMPLES_DIR "C:/Program Files/Derivative/TouchDesigner/Samples/CPlusPlus")
+if(NOT TD_SAMPLES_DIR AND WIN32)
+    # TouchDesigner 2025+ installs into versioned folders (TouchDesigner.2025.33230); the unversioned
+    # "TouchDesigner" folder of older installers is accepted too. The highest build wins. Mirrors
+    # PluginBuilderCore.find_td_installs so a standalone build finds the same samples tree as the COMP.
+    set(_td_pf "$ENV{ProgramFiles}")
+    if(NOT _td_pf)
+        set(_td_pf "C:/Program Files")
+    endif()
+    file(TO_CMAKE_PATH "${_td_pf}" _td_pf)
+    file(GLOB _td_installs LIST_DIRECTORIES true "${_td_pf}/Derivative/TouchDesigner*")
+    set(_td_best "")
+    set(_td_best_key "")
+    foreach(_d IN LISTS _td_installs)
+        if(NOT EXISTS "${_d}/Samples/CPlusPlus")
+            continue()
+        endif()
+        get_filename_component(_n "${_d}" NAME)
+        set(_key "0000.000000")
+        if(_n MATCHES "([0-9][0-9][0-9][0-9])\.([0-9]+)$")
+            set(_b "000000${CMAKE_MATCH_2}")
+            string(LENGTH "${_b}" _bl)
+            math(EXPR _bs "${_bl} - 6")
+            string(SUBSTRING "${_b}" ${_bs} 6 _b)
+            set(_key "${CMAKE_MATCH_1}.${_b}")
+        endif()
+        if(_td_best STREQUAL "" OR _key STRGREATER _td_best_key)
+            set(_td_best "${_d}")
+            set(_td_best_key "${_key}")
+        endif()
+    endforeach()
+    if(_td_best)
+        set(TD_SAMPLES_DIR "${_td_best}/Samples/CPlusPlus")
+    endif()
 endif()
 set(TD_SAMPLES_DIR "${TD_SAMPLES_DIR}" CACHE PATH "TouchDesigner Samples/CPlusPlus directory (for bundled 3rdParty)")
 
 option(TD_PLUGIN_WARNINGS "Enable strict warnings (/W4 /permissive-) for plugin targets" OFF)
+set(TD_PLUGIN_CXX_STANDARD 17 CACHE STRING "C++ standard for plugin targets (17 or 20)")
 option(TD_PLUGIN_ASAN "Enable AddressSanitizer for Debug builds of plugin targets" OFF)
 
 # ---------------------------------------------------------------------------------------------
@@ -77,17 +118,27 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 if(NOT DEFINED CMAKE_CXX_STANDARD)
-    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD ${TD_PLUGIN_CXX_STANDARD})
 endif()
+
+# ctest only generates CTestTestfile.cmake for directories where enable_testing() ran at directory
+# scope; calling it inside td_plugin_add_test() (a function) had no effect, so every consumer needed its
+# own top-level enable_testing(). include() runs in the caller's scope, so enabling it here fixes that.
+enable_testing()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Edit-and-Continue friendly PDB format for Debug/RelWithDebInfo (Visual Studio hot reload)
+# Debug information:
+#   Debug / RelWithDebInfo -> Edit-and-Continue PDB (Visual Studio hot reload)
+#   Release                -> plain PDB (/Zi) + /DEBUG at link, with /OPT:REF /OPT:ICF kept, so the binary
+#                             that ships is byte-for-byte the optimised one AND a profiler (VTune, WPA,
+#                             Superluminal) can symbolise it. The PDB stays in build/bin; only DLLs deploy.
+# CUDA-free projects only (nvcc does not understand the /ZI abstraction). Language-guarded with CXX.
 if(POLICY CMP0141)
     cmake_policy(SET CMP0141 NEW)
     set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
-        "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
+        "$<$<CONFIG:Debug,RelWithDebInfo>:$<IF:$<CXX_COMPILER_ID:MSVC>,EditAndContinue,ProgramDatabase>>$<$<CONFIG:Release>:ProgramDatabase>")
 endif()
 
 # Output layout expected by PluginBuilder:  build/bin/<Config>/<name>.dll
@@ -114,11 +165,14 @@ endif()
 # ---------------------------------------------------------------------------------------------
 # Helper: locate a 3rdParty package in the plugin, PluginBuilder or TouchDesigner samples tree
 # ---------------------------------------------------------------------------------------------
+# Order: the plugin's own copy, then the running TouchDesigner's samples tree (its libraries match the
+# DLLs TouchDesigner actually ships, e.g. OpenCV 4.11 / Python 3.11.x), then PluginBuilder's vendored
+# copy as a last resort for machines without the samples.
 function(_td_find_3rdparty out_var subdir)
     set(_candidates
         "${CMAKE_CURRENT_SOURCE_DIR}/3rdParty/${subdir}"
-        "${PLUGIN_BUILDER_DIR}/3rdParty/${subdir}"
-        "${TD_SAMPLES_DIR}/3rdParty/${subdir}")
+        "${TD_SAMPLES_DIR}/3rdParty/${subdir}"
+        "${PLUGIN_BUILDER_DIR}/3rdParty/${subdir}")
     foreach(_c IN LISTS _candidates)
         if(EXISTS "${_c}")
             set(${out_var} "${_c}" PARENT_SCOPE)
@@ -129,7 +183,12 @@ function(_td_find_3rdparty out_var subdir)
 endfunction()
 
 # ---------------------------------------------------------------------------------------------
-# td_add_plugin
+# td_add_plugin — the one call every generated project makes.
+# Globs source/ (CONFIGURE_DEPENDS so new files re-glob on build), creates a SHARED
+# library with no "lib" prefix, wires SDK includes + MSVC hardening, applies FEATURES,
+# and either deploys here (standalone: TDDeploy.cmake POST_BUILD) or leaves deploy to
+# PluginBuilder when PLUGINBUILDER_BUILD=1 is set in the environment.
+# FAMILY is mandatory and must be one of CHOP|TOP|DAT|SOP|POP.
 # ---------------------------------------------------------------------------------------------
 function(td_add_plugin name)
     set(_opts "")
@@ -145,10 +204,16 @@ function(td_add_plugin name)
     endif()
     get_filename_component(TDP_SOURCES_DIR "${TDP_SOURCES_DIR}" ABSOLUTE)
 
-    set(_langs CXX)
+    # CUDA must be enabled at DIRECTORY scope: enable_language() inside this function left the CUDA
+    # toolchain variables (CMAKE_CUDA_COMPILE_OBJECT, ...) in the function scope, so the configure failed
+    # with "Missing variable is: CMAKE_CUDA_COMPILE_OBJECT". Generated projects declare
+    # project(<name> LANGUAGES CXX CUDA) when the template has the cuda feature (CMakeBlocks.assemble).
     if("cuda" IN_LIST TDP_FEATURES)
-        enable_language(CUDA)
-        list(APPEND _langs CUDA)
+        get_property(_enabled GLOBAL PROPERTY ENABLED_LANGUAGES)
+        if(NOT "CUDA" IN_LIST _enabled)
+            message(FATAL_ERROR "td_add_plugin(${name} ... FEATURES cuda): enable CUDA at directory scope first, "
+                                "e.g. project(${name} LANGUAGES CXX CUDA) or enable_language(CUDA) before td_add_plugin().")
+        endif()
     endif()
 
     file(GLOB_RECURSE _sources CONFIGURE_DEPENDS
@@ -185,19 +250,24 @@ function(td_add_plugin name)
     endif()
 
     if(MSVC)
-        target_compile_options(${name} PRIVATE /MP /utf-8 /Zc:__cplusplus)
+        # MSVC flags are scoped to C++ sources: passed raw to nvcc for a .cu file they break the compile
+        # ("nvcc fatal: A single input file is required ..." for /W3).
+        # (/MP is deliberately absent: Ninja already builds translation units in parallel)
+        target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/utf-8 /Zc:__cplusplus>)
         if(TD_PLUGIN_WARNINGS)
-            target_compile_options(${name} PRIVATE /W4 /permissive-)
+            target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive->)
         else()
-            target_compile_options(${name} PRIVATE /W3)
+            target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W3>)
         endif()
-        # Debug info: Debug/RelWithDebInfo carry a PDB; Release stays lean (no /Zi, no /INCREMENTAL).
-        target_compile_options(${name} PRIVATE $<$<CONFIG:Debug,RelWithDebInfo>:/Zi>)
+        # Debug info format comes from CMAKE_MSVC_DEBUG_INFORMATION_FORMAT above; the linker must be told
+        # to emit the PDB for Release too. /OPT:REF /OPT:ICF are restated because /DEBUG would otherwise
+        # switch them off.
         target_link_options(${name} PRIVATE
             $<$<CONFIG:Debug>:/INCREMENTAL>
-            $<$<CONFIG:Release,RelWithDebInfo>:/INCREMENTAL:NO>)
+            $<$<CONFIG:Release,RelWithDebInfo>:/INCREMENTAL:NO>
+            $<$<CONFIG:Release>:/DEBUG /OPT:REF /OPT:ICF>)
         if(TD_PLUGIN_ASAN)
-            target_compile_options(${name} PRIVATE $<$<CONFIG:Debug>:/fsanitize=address>)
+            target_compile_options(${name} PRIVATE $<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CXX>>:/fsanitize=address>)
         endif()
     endif()
 
@@ -212,12 +282,16 @@ function(td_add_plugin name)
     endif()
 
     # Deployment directory (__Plugins__/<name> next to the .toe, two levels above PluginProjects/<name>)
+    # Callers may override with -DPLUGIN_DIR=... (dev/ci.py uses a throwaway __deploy__).
     if(NOT PLUGIN_DIR)
         set(PLUGIN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../__Plugins__/${name}")
     endif()
     get_filename_component(PLUGIN_DIR "${PLUGIN_DIR}" ABSOLUTE)
     set_target_properties(${name} PROPERTIES TD_PLUGIN_DEPLOY_DIR "${PLUGIN_DIR}")
 
+    # PLUGINBUILDER_BUILD is exported by PluginBuilderExt._env_factory / dev/ci.py so the
+    # extension owns the copy-to-__Plugins__ step (safe_replace_file + loader reload) and
+    # this module does not double-deploy mid-build.
     if(DEFINED ENV{PLUGINBUILDER_BUILD})
         message(STATUS "PluginBuilder is building ${name} (deploy handled by PluginBuilder)")
     else()
@@ -233,22 +307,38 @@ function(td_add_plugin name)
 endfunction()
 
 # ---------------------------------------------------------------------------------------------
-# td_plugin_optimize
+# td_plugin_optimize — release-only MSVC/GCC optimisation switches.
+# AVX2/AVX512 emit /arch:* (MSVC) or -mavx2 -mfma (GCC); FAST_MATH = /fp:fast | -ffast-math;
+# LTO = /GL + /LTCG on MSVC. CONFIG:Release,RelWithDebInfo always get /O2-style opts and
+# /OPT:REF /OPT:ICF. Headless tests/benches inherit LINK_OPTIONS via _td_add_console.
 # ---------------------------------------------------------------------------------------------
 function(td_plugin_optimize name)
-    cmake_parse_arguments(TDO "AVX2;AVX512;FAST_MATH;LTO" "" "" ${ARGN})
+    cmake_parse_arguments(TDO "AVX2;AVX512;FAST_MATH;LTO;REALTIME" "" "" ${ARGN})
+    if(TDO_REALTIME)
+        # The real-time preset: AVX2 + fast math + LTO, plus TD_PLUGIN_REALTIME=1 so code can assert
+        # it. Pair it with the runtime CPU guard (td_cpu_guard.h, on the include path whenever AVX2 or
+        # AVX512 is requested) so the plugin refuses to process on a CPU without AVX2/FMA instead of
+        # faulting TouchDesigner with an illegal instruction.
+        set(TDO_AVX2 TRUE)
+        set(TDO_FAST_MATH TRUE)
+        set(TDO_LTO TRUE)
+        target_compile_definitions(${name} PRIVATE TD_PLUGIN_REALTIME=1)
+    endif()
+    if(TDO_AVX2 OR TDO_AVX512)
+        target_include_directories(${name} PRIVATE "${PLUGIN_BUILDER_DIR}/cmake/td_runtime")
+    endif()
     if(MSVC)
-        target_compile_options(${name} PRIVATE $<$<CONFIG:Release,RelWithDebInfo>:/O2 /Oi /Ot /Gy>)
+        target_compile_options(${name} PRIVATE $<$<AND:$<CONFIG:Release,RelWithDebInfo>,$<COMPILE_LANGUAGE:CXX>>:/O2 /Oi /Ot /Gy>)
         if(TDO_AVX512)
-            target_compile_options(${name} PRIVATE /arch:AVX512)
+            target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX512>)
         elseif(TDO_AVX2)
-            target_compile_options(${name} PRIVATE /arch:AVX2)
+            target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
         endif()
         if(TDO_FAST_MATH)
-            target_compile_options(${name} PRIVATE /fp:fast)
+            target_compile_options(${name} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/fp:fast>)
         endif()
         if(TDO_LTO)
-            target_compile_options(${name} PRIVATE $<$<CONFIG:Release>:/GL>)
+            target_compile_options(${name} PRIVATE $<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CXX>>:/GL>)
             target_link_options(${name} PRIVATE $<$<CONFIG:Release>:/LTCG>)
         endif()
         target_link_options(${name} PRIVATE $<$<CONFIG:Release,RelWithDebInfo>:/OPT:REF /OPT:ICF>)
@@ -265,6 +355,8 @@ endfunction()
 
 # ---------------------------------------------------------------------------------------------
 # td_plugin_add_runtime_dll — copy runtime DLLs next to the built plugin (and deploy them)
+# Also stages into TD_PLUGIN_DEPLOY_DIR on standalone builds so third-party DLLs land in
+# __Plugins__/<name>/ beside the plugin (PluginBuilder builds stage via safe_replace_file instead).
 # ---------------------------------------------------------------------------------------------
 function(td_plugin_add_runtime_dll name)
     foreach(_dll IN LISTS ARGN)
@@ -272,6 +364,13 @@ function(td_plugin_add_runtime_dll name)
             message(WARNING "td_plugin_add_runtime_dll(${name}): ${_dll} does not exist")
             continue()
         endif()
+        # Record the intended runtime set: PluginBuilder stages exactly these next to the plugin
+        # (build/<name>_runtime_dlls.txt) instead of sweeping every *.dll it finds in bin/.
+        get_filename_component(_dll_name "${_dll}" NAME)
+        set_property(TARGET ${name} APPEND PROPERTY TD_PLUGIN_RUNTIME_DLLS "${_dll_name}")
+        get_target_property(_all_rt ${name} TD_PLUGIN_RUNTIME_DLLS)
+        string(REPLACE ";" "\n" _rt_text "${_all_rt}")
+        file(WRITE "${CMAKE_BINARY_DIR}/${name}_runtime_dlls.txt" "${_rt_text}\n")
         add_custom_command(TARGET ${name} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dll}" "$<TARGET_FILE_DIR:${name}>"
             COMMENT "Staging runtime DLL ${_dll}"
@@ -316,7 +415,7 @@ endfunction()
 #     file rename does not achieve that, so the .def is regenerated with the correct LIBRARY line
 #     and lib.exe is re-run whenever the .def is newer than the .lib.
 #
-# DYNAMIC (option, off by default):
+#   DYNAMIC (option, off by default):
 #   Skip linking the import library; the target resolves fftwf_* through LoadLibrary/GetProcAddress at
 #   run time instead. Required whenever more than one FFT library may be selected at run time, because
 #   FFTW3 and Intel oneMKL's FFTW3 interface export the SAME fftwf_* names - linking one of them makes
@@ -324,6 +423,9 @@ endfunction()
 #   the loader found first). The header directory and the runtime DLL copy are still set up, and
 #   TD_PLUGIN_FFTW3_DYNAMIC=1 is defined, so the code can assert it is not calling a linked symbol.
 #   Probes and benchmarks that only ever want one implementation should not pass DYNAMIC.
+#
+#   Known consumer: ../Plugin_FFT pins VERSION 3.3.11-avx2 DYNAMIC (AVX2 codelets; performance is a
+#   property of that exact vendored binary — see the layout notes above).
 # ---------------------------------------------------------------------------------------------
 function(td_plugin_use_fftw3 name)
     cmake_parse_arguments(TDF "DYNAMIC" "ROOT;PRECISION;VERSION" "" ${ARGN})
@@ -391,50 +493,50 @@ function(td_plugin_use_fftw3 name)
     endif()
 
     # ---- import library ----------------------------------------------------------------------
-    set(_def "${TDF_ROOT}/lib/${_lib}.def")
-    set(_imp "${TDF_ROOT}/lib/${_lib}.lib")
-
     # The .def's LIBRARY line is what the linker bakes into the import library, and the loader
     # follows *that* name, not the .lib's file name. Renaming libfftw3f-3.{dll,lib} to a versioned
     # name without editing the line inside the .def produces an import library that still demands
-    # libfftw3f-3.dll at load time - the plugin then fails with "module not found" while the
-    # correctly-named DLL sits right next to it. The two names are required to agree, so enforce it
-    # here rather than relying on whoever renames the next version to notice.
+    # libfftw3f-3.dll at load time. The two names are required to agree, so it is enforced here.
+    #
+    # Nothing is ever written into the vendored tree: a configure used to rewrite the .def and re-run
+    # lib.exe in 3rdParty/ whenever the .def was not older than the .lib (IS_NEWER_THAN is also true on
+    # equal timestamps, i.e. after every git checkout), which left the vendored .lib permanently
+    # "modified" in git. Now the vendored .lib is used as-is when its .def agrees with the DLL name, and
+    # otherwise a corrected .def + .lib are generated under ${CMAKE_BINARY_DIR}/td_deps/.
+    set(_def "${TDF_ROOT}/lib/${_lib}.def")
+    set(_imp "${TDF_ROOT}/lib/${_lib}.lib")
+    set(_def_ok TRUE)
     if(EXISTS "${_def}")
         file(STRINGS "${_def}" _def_lib_line REGEX "^LIBRARY")
         if(_def_lib_line AND NOT _def_lib_line STREQUAL "LIBRARY ${_lib}.dll")
-            message(STATUS "td_plugin_use_fftw3(${name}): .def declares '${_def_lib_line}', rewriting to 'LIBRARY ${_lib}.dll'")
-            file(READ "${_def}" _def_text)
+            set(_def_ok FALSE)
+        endif()
+    endif()
+    if(MSVC AND EXISTS "${_def}" AND (NOT EXISTS "${_imp}" OR NOT _def_ok))
+        set(_gen_dir "${CMAKE_BINARY_DIR}/td_deps/fftw3")
+        file(MAKE_DIRECTORY "${_gen_dir}")
+        file(READ "${_def}" _def_text)
+        if(_def_lib_line)
             string(REPLACE "${_def_lib_line}" "LIBRARY ${_lib}.dll" _def_text "${_def_text}")
-            file(WRITE "${_def}" "${_def_text}")
         endif()
-    endif()
-
-    if(MSVC AND EXISTS "${_def}")
-        set(_need_lib NOT EXISTS "${_imp}")
-        if(NOT _need_lib)
-            # Rebuild when the export list changed underneath the import library.
-            if("${_def}" IS_NEWER_THAN "${_imp}")
-                set(_need_lib TRUE)
-            endif()
-        endif()
-        if(_need_lib)
-            find_program(MSVC_LIB_EXE lib.exe)
-            if(MSVC_LIB_EXE)
-                message(STATUS "td_plugin_use_fftw3(${name}): generating ${_lib}.lib from ${_lib}.def")
-                execute_process(COMMAND "${MSVC_LIB_EXE}" /nologo /machine:x64 "/def:${_def}" "/out:${_imp}"
-                                WORKING_DIRECTORY "${TDF_ROOT}/lib" RESULT_VARIABLE _r)
-                if(NOT _r EQUAL 0)
-                    message(WARNING "td_plugin_use_fftw3(${name}): lib.exe failed to generate ${_lib}.lib (exit ${_r})")
-                endif()
+        file(WRITE "${_gen_dir}/${_lib}.def" "${_def_text}")
+        find_program(MSVC_LIB_EXE lib.exe)
+        if(MSVC_LIB_EXE)
+            message(STATUS "td_plugin_use_fftw3(${name}): generating ${_gen_dir}/${_lib}.lib (vendored .lib missing or naming a different DLL)")
+            execute_process(COMMAND "${MSVC_LIB_EXE}" /nologo /machine:x64 "/def:${_gen_dir}/${_lib}.def" "/out:${_gen_dir}/${_lib}.lib"
+                            WORKING_DIRECTORY "${_gen_dir}" RESULT_VARIABLE _r OUTPUT_QUIET)
+            if(_r EQUAL 0)
+                set(_imp "${_gen_dir}/${_lib}.lib")
             else()
-                message(WARNING "td_plugin_use_fftw3(${name}): lib.exe not found, cannot generate ${_lib}.lib from ${_lib}.def")
+                message(WARNING "td_plugin_use_fftw3(${name}): lib.exe failed to generate ${_lib}.lib (exit ${_r})")
             endif()
+        else()
+            message(WARNING "td_plugin_use_fftw3(${name}): lib.exe not found, cannot generate ${_lib}.lib from ${_lib}.def")
         endif()
     endif()
 
-    if(EXISTS "${TDF_ROOT}/lib/${_lib}.lib")
-        set(FFTW3_LIBRARY "${TDF_ROOT}/lib/${_lib}.lib")
+    if(EXISTS "${_imp}")
+        set(FFTW3_LIBRARY "${_imp}")
     else()
         unset(FFTW3_LIBRARY CACHE)
         find_library(FFTW3_LIBRARY NAMES ${_lib} PATHS "${TDF_ROOT}/lib" "${TDF_ROOT}" NO_DEFAULT_PATH)
@@ -516,13 +618,20 @@ endfunction()
 
 # ---------------------------------------------------------------------------------------------
 # td_plugin_use_cuda — TouchDesigner 2025 samples ship against CUDA 12.x
+# Arch list covers Turing..Blackwell; override with -DCMAKE_CUDA_ARCHITECTURES=native for a
+# local GPU-only build. Requires CUDA enabled at directory scope (project(... LANGUAGES CXX CUDA)) and FEATURES cuda.
 # ---------------------------------------------------------------------------------------------
 function(td_plugin_use_cuda name)
     find_package(CUDAToolkit REQUIRED)
     if(NOT CMAKE_CUDA_ARCHITECTURES)
-        # Turing .. Blackwell; use "native" for a dev-only build of the current GPU
-        set(CMAKE_CUDA_ARCHITECTURES 75 80 86 89 90 120 PARENT_SCOPE)
-        set_property(TARGET ${name} PROPERTY CUDA_ARCHITECTURES 75 80 86 89 90 120)
+        # Turing .. Hopper; Blackwell (120) only when the toolkit knows it (CUDA >= 12.8), otherwise
+        # nvcc rejects the whole configure. Use "native" for a dev-only build of the current GPU.
+        set(_archs 75 80 86 89 90)
+        if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL 12.8)
+            list(APPEND _archs 120)
+        endif()
+        set(CMAKE_CUDA_ARCHITECTURES ${_archs} PARENT_SCOPE)
+        set_property(TARGET ${name} PROPERTY CUDA_ARCHITECTURES ${_archs})
     endif()
     message(STATUS "CUDA Toolkit ${CUDAToolkit_VERSION}: ${CUDAToolkit_INCLUDE_DIRS}")
     target_include_directories(${name} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
@@ -532,6 +641,8 @@ endfunction()
 
 # ---------------------------------------------------------------------------------------------
 # td_plugin_use_python — embedded CPython headers/import lib (vendored or from TD samples)
+# Used by the CHOPWithPythonClass template (FEATURES python). Picks the newest python3*.lib
+# under 3rdParty/Python/lib/x64 (skips the bare python3.lib stub).
 # ---------------------------------------------------------------------------------------------
 function(td_plugin_use_python name)
     _td_find_3rdparty(_py Python)
@@ -539,8 +650,10 @@ function(td_plugin_use_python name)
         message(FATAL_ERROR "td_plugin_use_python(${name}): 3rdParty/Python not found")
     endif()
     target_include_directories(${name} PRIVATE "${_py}/Include" "${_py}/Include/PC")
+    # python3XY.lib only (not the python3.lib stable-ABI stub, not *_d debug libs); highest minor wins.
     file(GLOB _pylibs "${_py}/lib/x64/python3*.lib")
-    list(FILTER _pylibs EXCLUDE REGEX "python3\\.lib$")
+    list(FILTER _pylibs INCLUDE REGEX "python3[0-9]+\\.lib$")
+    list(SORT _pylibs COMPARE NATURAL ORDER DESCENDING)
     if(_pylibs)
         list(GET _pylibs 0 _pylib)
         target_link_libraries(${name} PRIVATE "${_pylib}")
@@ -552,6 +665,7 @@ endfunction()
 
 # ---------------------------------------------------------------------------------------------
 # td_plugin_use_opencv — vendored OpenCV (headers + import libs), as shipped with TD samples
+# Links non-debug Win64 import libs; runtime DLLs are staged via td_plugin_add_runtime_dll.
 # ---------------------------------------------------------------------------------------------
 function(td_plugin_use_opencv name)
     cmake_parse_arguments(TDC "" "" "COMPONENTS" ${ARGN})
@@ -561,7 +675,22 @@ function(td_plugin_use_opencv name)
     endif()
     target_include_directories(${name} PRIVATE "${_cv}/include")
     file(GLOB _cvlibs "${_cv}/lib/Win64/*.lib" "${_cv}/lib/*.lib")
-    list(FILTER _cvlibs EXCLUDE REGEX "d\\.lib$")
+    list(FILTER _cvlibs EXCLUDE REGEX "[0-9]d\\.lib$")   # debug import libs end in <version>d.lib
+    if(TDC_COMPONENTS)
+        # Link only what was asked for (e.g. COMPONENTS core imgproc): fewer import libraries, fewer
+        # DLL dependencies for the loader to resolve when TouchDesigner maps the plugin.
+        set(_wanted "")
+        foreach(_c IN LISTS TDC_COMPONENTS)
+            foreach(_l IN LISTS _cvlibs)
+                get_filename_component(_ln "${_l}" NAME_WE)
+                if(_ln MATCHES "^opencv_${_c}[0-9]*$" OR _ln MATCHES "^opencv_world[0-9]*$")
+                    list(APPEND _wanted "${_l}")
+                endif()
+            endforeach()
+        endforeach()
+        list(REMOVE_DUPLICATES _wanted)
+        set(_cvlibs ${_wanted})
+    endif()
     target_link_libraries(${name} PRIVATE ${_cvlibs})
     file(GLOB _cvdlls "${_cv}/bin/*.dll" "${_cv}/lib/Win64/*.dll")
     if(_cvdlls)
@@ -572,6 +701,9 @@ endfunction()
 # ---------------------------------------------------------------------------------------------
 # td_plugin_add_test / td_plugin_add_bench — headless executables that reuse the plugin sources
 #   (no TouchDesigner needed). The plugin's include dirs / definitions are inherited.
+#   Inherit compile AND link options so an LTO plugin is measured with /GL+/LTCG, not silently
+#   degraded. Strip TD_PLUGIN_FFTW3_DYNAMIC from the exe defs: these tools link the import lib
+#   directly (single-backend by construction). Run via PluginBuilderExt.run_tests (ctest).
 # ---------------------------------------------------------------------------------------------
 function(_td_add_console name target kind)
     cmake_parse_arguments(TDT "" "" "SOURCES;LINK" ${ARGN})
@@ -624,11 +756,22 @@ function(_td_add_console name target kind)
 endfunction()
 
 function(td_plugin_add_test name target)
-    enable_testing()
     _td_add_console(${name} ${target} test ${ARGN})
     add_test(NAME ${target} COMMAND ${target} WORKING_DIRECTORY "$<TARGET_FILE_DIR:${target}>")
 endfunction()
 
+# td_plugin_add_bench(<name> <target> SOURCES ... [LINK ...] [GATE <baseline.json> [GATE_ARGS ...]])
+# GATE registers a ctest named <target>_gate with the label "perf": it runs
+#   <target> --gate <baseline.json> [GATE_ARGS...]
+# and the bench decides pass/fail against the baseline (the bench owns the metric and the tolerance).
+# Run with `ctest -L perf`; exclude with `ctest -LE perf` (timing is machine-dependent).
 function(td_plugin_add_bench name target)
-    _td_add_console(${name} ${target} bench ${ARGN})
+    cmake_parse_arguments(TDB "" "GATE" "GATE_ARGS" ${ARGN})
+    _td_add_console(${name} ${target} bench ${TDB_UNPARSED_ARGUMENTS})
+    if(TDB_GATE)
+        get_filename_component(_gate "${TDB_GATE}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+        add_test(NAME ${target}_gate COMMAND ${target} --gate "${_gate}" ${TDB_GATE_ARGS}
+                 WORKING_DIRECTORY "$<TARGET_FILE_DIR:${target}>")
+        set_tests_properties(${target}_gate PROPERTIES LABELS perf RUN_SERIAL TRUE)
+    endif()
 endfunction()

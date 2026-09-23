@@ -3,7 +3,7 @@
   "defaults": {},
   "configurations": [
     {
-      "name": "Launch __TD_PROJECT_NAME__.toe",
+      "name": "Launch __TD_PROJECT_NAME__.toe [Debug]",
       "project": "CMakeLists.txt",
       "projectTarget": "__PLUGIN_NAME__.dll (bin\\Debug\\__PLUGIN_NAME__.dll)",
       "args": [
@@ -14,7 +14,7 @@
       "exe": "__TD_PATH__"
     },
     {
-      "name": "Launch __TD_PROJECT_NAME__.toe",
+      "name": "Launch __TD_PROJECT_NAME__.toe [Release]",
       "project": "CMakeLists.txt",
       "projectTarget": "__PLUGIN_NAME__.dll (bin\\Release\\__PLUGIN_NAME__.dll)",
       "args": [
@@ -25,7 +25,7 @@
       "exe": "__TD_PATH__"
     },
     {
-      "name": "Launch __TD_PROJECT_NAME__.toe",
+      "name": "Launch __TD_PROJECT_NAME__.toe [RelWithDebInfo]",
       "project": "CMakeLists.txt",
       "projectTarget": "__PLUGIN_NAME__.dll (bin\\RelWithDebInfo\\__PLUGIN_NAME__.dll)",
       "args": [

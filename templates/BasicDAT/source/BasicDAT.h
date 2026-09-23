@@ -68,6 +68,7 @@ private:
 	float               myChopChanVal;
 	std::string         myChop;
 
+	// Path of the input DAT, shown in the Info DAT.
 	std::string         myDat;
 
 

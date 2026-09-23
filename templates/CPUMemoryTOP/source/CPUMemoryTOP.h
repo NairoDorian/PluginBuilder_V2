@@ -16,11 +16,17 @@
 #include "FrameQueue.h"
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 using namespace TD;
 
+// One instance per TOP node. Fills CPU memory and uploads it as the TOP's
+// texture (TOP_ExecuteMode::CPUMem). With THREADING_EXAMPLE defined in the .cpp,
+// a producer thread fills the buffers; the destructor stops and joins it.
 class CPUMemoryTOP : public TOP_CPlusPlusBase
 {
 public:
+	// The TOP_Context is kept to create output buffers (also from the producer thread).
 	CPUMemoryTOP(const OP_NodeInfo *info, TOP_Context* context);
 	virtual ~CPUMemoryTOP();
 
@@ -30,6 +36,8 @@ public:
 							const OP_Inputs*,
 							void* reserved1) override;
 
+	// Writes one width x height RGBA32Float image at byteOffset. Static and
+	// only uses its arguments, so it is safe to call from the producer thread.
 	static void			fillBuffer(OP_SmartRef<TOP_Buffer>& mem, uint64_t byteOffset, int width, int height, double step, double brightness);
 
 
@@ -46,12 +54,17 @@ public:
 	virtual void		setupParameters(OP_ParameterManager *manager, void *reserved1) override;
 	virtual void		pulsePressed(const char *name, void *reserved1) override;
 
+	// Producer side of the THREADING_SIGNALED_PRODUCER handshake: blocks until
+	// startMoreWork() is called.
 	void				waitForMoreWork();
 
 private:
 
+	// Non-threaded path of execute(): create a buffer, fill each layer, upload.
 	void				fillAndUpload(TOP_Output* output, double speed, int width, int height, OP_TexDim texDim, int numLayers, int colorBufferIndex);
 
+	// Wakes the producer thread: called by execute() in THREADING_SIGNALED_PRODUCER
+	// mode, and by the destructor in every threading mode so a waiting thread can exit.
 	void				startMoreWork();
 	// We don't need to store this pointer, but we do for the example.
 	// The OP_NodeInfo class store information about the node that's using
@@ -62,8 +75,11 @@ private:
 	// function is called, then passes back to the TOP
 	int					myExecuteCount;
 
+	// mySpeed/myBrightness are written by execute() and read by the producer
+	// thread under mySettingsLock. myStep is also read without the lock by the
+	// Info CHOP/DAT callbacks, hence atomic; increments/resets take the lock.
 	std::mutex			mySettingsLock;
-	double				myStep;
+	std::atomic<double>	myStep;
 	double				mySpeed;
 	double				myBrightness;
 

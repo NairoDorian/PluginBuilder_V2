@@ -592,8 +592,19 @@ public:
 	// Override this method if you want to specify a descriptor string when hovering over the input connectors of the node.
 	// `inputLabel->label->setString()` sets the label for the input index.
 	// Usage example in Samples/CPlusPlus/CHOP sample project.
+	// Note that this label is only visible when the dll is loaded as a Custom Operator, not in the CPlusPlus OPs.
 	virtual void
 	inputConnectorLabel(int index, OP_InputLabel* inputLabel, void* reserved1)
+	{
+	}
+
+	// Override this method in order to enable/disable custom parameters by setting their enable states
+	// `parEnableState->setEnableState()` sets the enable state.
+	// this workflow supersedes the usage of `inputs->enablePar()`.
+	// Note that this callback may be called anytime, not just during cooking
+	// Usage example in Samples/CPlusPlus/CHOP sample project.
+	virtual void
+	setParameterEnableStates(const OP_Inputs* inputs, OP_ParEnableState* parEnableState, void* reserved1)
 	{
 	}
 
@@ -603,7 +614,6 @@ public:
 private:
 
 	// Reserved for future features
-	virtual int32_t	reservedFunc9() { return 0; }
 	virtual int32_t	reservedFunc10() { return 0; }
 	virtual int32_t	reservedFunc11() { return 0; }
 	virtual int32_t	reservedFunc12() { return 0; }

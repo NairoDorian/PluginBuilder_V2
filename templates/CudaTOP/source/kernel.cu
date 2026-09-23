@@ -12,6 +12,9 @@
 * prior written permission from Derivative.
 */
 
+// CUDA kernels for CudaTOP. doCUDAOperation() is called by CudaTOP::execute()
+// between beginCUDAOperations() and endCUDAOperations().
+
 #include "CPlusPlus_Common.h"
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
@@ -19,6 +22,8 @@
 #include <algorithm>
 #include <stdio.h>
 
+// copyTextureRGBA82D - device kernel: byte-wise copy of an 8-bit BGRA 2D
+// surface from input to output, one thread per pixel.
 __global__ void
 copyTextureRGBA82D(int width, int height, cudaSurfaceObject_t input, cudaSurfaceObject_t output)
 {
@@ -33,6 +38,7 @@ copyTextureRGBA82D(int width, int height, cudaSurfaceObject_t input, cudaSurface
 	surf2Dwrite(color, output, x * 4, y, cudaBoundaryModeZero);
 }
 
+// copyTextureRGBA83D - device kernel: 3D volume copy of an 8-bit BGRA surface.
 __global__ void
 copyTextureRGBA83D(int width, int height, cudaSurfaceObject_t input, cudaSurfaceObject_t output)
 {
@@ -48,6 +54,7 @@ copyTextureRGBA83D(int width, int height, cudaSurfaceObject_t input, cudaSurface
 	surf3Dwrite(color, output, x * 4, y, z, cudaBoundaryModeZero);
 }
 
+// copyTextureRGBA8Cube - device kernel: cubemap face copy (6 faces via z).
 __global__ void
 copyTextureRGBA8Cube(int width, int height, cudaSurfaceObject_t input, cudaSurfaceObject_t output)
 {
@@ -63,6 +70,7 @@ copyTextureRGBA8Cube(int width, int height, cudaSurfaceObject_t input, cudaSurfa
 	surfCubemapwrite(color, output, x * 4, y, z, cudaBoundaryModeZero);
 }
 
+// copyTextureRGBA82DArray - device kernel: layered 2D array copy.
 __global__ void
 copyTextureRGBA82DArray(int width, int height, cudaSurfaceObject_t input, cudaSurfaceObject_t output)
 {
@@ -78,6 +86,7 @@ copyTextureRGBA82DArray(int width, int height, cudaSurfaceObject_t input, cudaSu
 	surf2DLayeredwrite(color, output, x * 4, y, z, cudaBoundaryModeZero);
 }
 
+// fillOutput - device kernel: solid-color fill used when no input is connected.
 __global__ void
 fillOutput(int width, int height, uchar4 color, cudaSurfaceObject_t output)
 {
@@ -96,6 +105,9 @@ divUp(int a, int b)
 	return ((a % b) != 0) ? (a / b + 1) : (a / b);
 }
 
+// Host entry point. Copies the input with the kernel matching its OP_TexDim, or
+// fills the output with 'color' when there is no input, on 'stream'. Returns the
+// launch status (and, in Debug builds, the status after the kernel has run).
 cudaError_t
 doCUDAOperation(int width, int height, int depth, TD::OP_TexDim dim, float4 color, cudaSurfaceObject_t input, cudaSurfaceObject_t output, cudaStream_t stream)
 {
@@ -135,16 +147,25 @@ doCUDAOperation(int width, int height, int depth, TD::OP_TexDim dim, float4 colo
 		fillOutput<<<gridSize, blockSize, 0, stream>>> (width, height, c8, output);
 	}
 
-
-#ifdef _DEBUG
-	// any errors encountered during the launch.
-	cudaStatus = cudaDeviceSynchronize();
+	// Launch errors (invalid configuration, bad surface...) are available
+	// without synchronizing, so check them in every build and return them to
+	// the caller (the official sample only checked in Debug builds).
+	cudaStatus = cudaGetLastError();
 	if (cudaStatus != cudaSuccess)
 	{
-		fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching kernel!\n", cudaStatus);
+		fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
+		return cudaStatus;
 	}
-#else
-	cudaStatus = cudaSuccess;
+
+#ifdef _DEBUG
+	// Errors raised while the kernel runs only show up after a sync. Debug
+	// only, since it stalls the CPU; waits for this stream only
+	// (cudaDeviceSynchronize would also wait for TouchDesigner's own CUDA work).
+	cudaStatus = cudaStreamSynchronize(stream);
+	if (cudaStatus != cudaSuccess)
+	{
+		fprintf(stderr, "cudaStreamSynchronize returned error code %d after launching kernel!\n", cudaStatus);
+	}
 #endif
 
 	return cudaStatus;

@@ -15,9 +15,13 @@
 #include "TOP_CPlusPlusBase.h"
 #include "cuda_runtime.h"
 #include <array>
+#include <string>
 
 using namespace TD;
 
+// One instance per TOP node, in TOP_ExecuteMode::CUDA. The constructor creates
+// a CUDA stream; execute() wraps the input/output cudaArrays in surface objects
+// and runs the kernels in kernel.cu on that stream.
 class CudaTOP : public TOP_CPlusPlusBase
 {
 public:
@@ -41,6 +45,7 @@ public:
 											OP_InfoDATEntries *entries,
 											void* reserved) override;
 
+	// Reports myError (unsupported input format or a CUDA error from the last cook).
 	virtual void		getErrorString(OP_String *error, void* reserved) override;
 
 	virtual void		setupParameters(OP_ParameterManager *manager, void* reserved) override;
@@ -61,5 +66,5 @@ private:
 	cudaStream_t		myStream;
 
 	TOP_Context*		myContext;
-	const char*			myError;
+	std::string			myError;
 };

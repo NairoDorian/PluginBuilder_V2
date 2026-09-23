@@ -5,6 +5,12 @@
 # Uses the rename-in-place trick: a DLL that TouchDesigner has loaded cannot be overwritten, but it CAN be
 # renamed. So <Name>.dll is renamed to <Name>.dll.old (any previous .old is removed first), then the new
 # build is copied into place. TouchDesigner picks the new file up on its next re-init of the plugin.
+#
+# Standalone only: when PLUGINBUILDER_BUILD=1 is in the environment (set by PluginBuilderExt /
+# dev/ci.py), TDPlugin.cmake omits this POST_BUILD command and PluginBuilder itself deploys via
+# PluginBuilderCore.safe_replace_file (same algorithm, plus a SHA-256 "unchanged" gate).
+# Invoked from TDPlugin.cmake td_add_plugin(); the sibling repo ../Plugin_FFT consumes this path
+# when built from Visual Studio / the command line without PluginBuilder running.
 
 if(NOT SRC OR NOT DST_DIR)
     message(FATAL_ERROR "TDDeploy.cmake: SRC and DST_DIR are required")
@@ -21,6 +27,8 @@ if(EXISTS "${_old}")
 endif()
 
 if(EXISTS "${_dst}")
+    # Skip the swap entirely when bytes are identical — avoids churning the loader
+    # for a no-op rebuild (mirrors safe_replace_file's 'unchanged' short-circuit).
     file(SHA256 "${_dst}" _cur)
     file(SHA256 "${SRC}" _new)
     if(_cur STREQUAL _new)

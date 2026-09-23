@@ -23,16 +23,19 @@ if a CHOP is connected to the CPlusPlus CHOPs input or not.
 The example is timesliced, which is the more complex way of working.
 
 If an input is connected the node will output the same number of channels as the
-input and divide the first 'N' samples in the input channel by 2. 'N' being the current
-timeslice size. This is noteworthy because if the input isn't changing then the output
-will look wierd since depending on the timeslice size some number of the first samples
-of the input will get used.
+input and multiply the first 'N' samples of each input channel by the Scale parameter.
+'N' being the current timeslice size. This is noteworthy because if the input isn't
+changing then the output will look wierd since depending on the timeslice size some
+number of the first samples of the input will get used.
 
-If no input is connected then the node will output a smooth sine wave at 120hz.
+If no input is connected then the node generates a sine/square/ramp wave sampled at
+120 samples per second (the Speed parameter sets how fast it oscillates).
 */
 
 
 // To get more help about these functions, look at CHOP_CPlusPlusBase.h
+// One instance is created per CHOP node (CreateCHOPInstance) and deleted by
+// DestroyCHOPInstance. setParameterEnableStates() may be called outside a cook.
 class BasicCHOP : public CHOP_CPlusPlusBase
 {
 public:
@@ -68,6 +71,8 @@ public:
 
 	virtual void		inputConnectorLabel(int index, OP_InputLabel* inputLabel, void* reserved1) override;
 
+	virtual void		setParameterEnableStates(const OP_Inputs* inputs, OP_ParEnableState* parEnableState, void* reserved1) override;
+
 private:
 
 	// We don't need to store this pointer, but we do for the example.
@@ -79,7 +84,7 @@ private:
 	// function is called, then passes back to the CHOP 
 	int32_t				myExecuteCount;
 
-
+	// Phase of the generated waveform; reset by the Reset pulse.
 	double				myOffset;
 
 
