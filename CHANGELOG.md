@@ -10,6 +10,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [2.2.0] - 2026-11-08
+
+### Added
+- **Live enable-state mirror.** A plugin greys parameters out with `setParameterEnableStates` (C++ API
+  Common 3) on the hidden `plugin_loader`. The COMP's mirrored parameters copied `enable` / `readOnly` only
+  during a full `sync_custom_parameters` (init, reload, Refreshcustompars), so a plugin's greying rules never
+  showed on the COMP while you edited it. Now an edit of any mirrored parameter queues **one** deferred pass
+  (`_sync_enable_states`, `run(..., delayFrames=2)`, coalesced) that copies just those two attributes, loader
+  → mirror. Nothing runs per frame when idle; a pass that finds nothing changed writes nothing. Plugin_FFT
+  2.13's Multi-FFT ("Window Sampling is taken over") is the first rule that depends on it.
+
+### Recorded here for the first time (shipped in `24b8ff5`, 2026-09-23, previously in no CHANGELOG entry)
+- Off-thread staging and install: rename-in-place deploy, a size+mtime fast path for files older than 2 s,
+  a runtime-DLL manifest, and fresh-loader reload with a parameter snapshot/restore.
+- **ParamGen** (`source/ParamGen.py`, `dev/gen_parameters.py`): `parameters.json` → `Parameters.h/.cpp`;
+  Generate Parameters and Bake for Performance pulses.
+- **RealtimeCHOP template** (core header, tests, bench) and a NOTES.md per template; the templates build
+  warning-free.
+- `cmake/TDPlugin.cmake`: `td_plugin_optimize REALTIME`, `td_plugin_add_bench GATE` (ctest label `perf`),
+  `cmake/td_runtime/td_cpu_guard.h`; CUDA enabled at directory scope, MSVC flags scoped to CXX.
+- `include/`: SDK headers synced to TouchDesigner 2025.33230 (Common API 3, `BitMaskFlags.h`).
+- `dev/ci.py` runs each project's ctest (the `perf` label is excluded).
+
+### Tests
+- 46 unit tests (45 + `test_enable_states_follow_the_loader_after_an_edit`: one queued pass per burst of
+  edits, enable/readOnly copied, 0 writes in the steady state).
+
+### Still open
+- **Not yet confirmed in TouchDesigner** that the CPlusPlus CHOP host applies `setParameterEnableStates` to
+  the loader's custom parameters at a point the 2-frame delay catches. If it does not, the delay is the knob
+  (`ENABLE_SYNC_DELAY_FRAMES`); the fallback is evaluating a ParamGen spec's `enable_if` rules in Python.
+- `PluginBuilder.tox` (2024-04-20) and `dev/dev.toe` (2024-07-08) still need a re-export from a live session.
+
+---
+
 ## [Unreleased] - 2026-09-22
 
 ### Documentation

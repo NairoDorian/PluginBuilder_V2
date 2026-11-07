@@ -173,6 +173,9 @@ def make_ext(mod, owner):
     ext.verbose = False
     ext._last_synced_sig = None
     ext._last_synced_pars = None
+    ext._enable_sync_pending = False
+    ext.on_par_value_change_map = {}
+    ext.on_par_pulse_map = {}
     ext._log = lambda *a, **k: None
     return ext
 
@@ -221,6 +224,27 @@ class ExtMirrorTests(unittest.TestCase):
         self.ext._last_synced_sig = None                 # force the rebuild path with existing mirror pars
         self.ext.sync_custom_parameters(force_rebuild=False)
         self.assertEqual(self.owner.par.Gain.label, 'Gain (dB)')
+
+    def test_enable_states_follow_the_loader_after_an_edit(self):
+        """X2: an edit of a mirrored parameter queues ONE deferred pass that copies enable/readOnly."""
+        self.ext.sync_custom_parameters(force_rebuild=True)
+        loader = self.owner.op('plugin_loader')
+        queued = []
+        self.mod.run = lambda *a, **k: queued.append((a, k))
+        self.ext._enable_sync_pending = False
+        self.owner.par.Gain.mode = ParMode.BIND
+        self.ext.OnParValueChange(self.owner.par.Gain, 0.0)
+        self.ext.OnParValueChange(self.owner.par.Gain, 0.1)   # coalesced: still one queued pass
+        self.assertEqual(len(queued), 1)
+        self.assertGreaterEqual(queued[0][1].get('delayFrames', 0), 1)
+        # the plugin greyed Scale out and made Gain read-only on the loader
+        loader.par.Scale.enable = False
+        loader.par.Gain.readOnly = True
+        self.assertEqual(self.ext._sync_enable_states(), 2)
+        self.assertFalse(self.owner.par.Scale.enable)
+        self.assertTrue(self.owner.par.Gain.readOnly)
+        self.assertFalse(self.ext._enable_sync_pending)
+        self.assertEqual(self.ext._sync_enable_states(), 0)  # steady state writes nothing
 
     def test_snapshot_restore_round_trip(self):
         """_snapshot_loader_values / _restore_loader_values work (they call the module-level _par_mode)."""

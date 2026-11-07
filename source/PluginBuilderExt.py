@@ -175,6 +175,7 @@ class PluginBuilderExt:
         self._last_copied_hash = None
         self._last_synced_sig = None
         self._last_synced_pars = None
+        self._enable_sync_pending = False       # one deferred enable/readOnly refresh is queued (coalesced)
         self._rebuild_after_current = False
         self._poll_scheduled = False
         self._last_status = ''
@@ -1394,10 +1395,67 @@ class PluginBuilderExt:
     #  maps built in __init__; everything else is forwarded to the loader (mirror writes).      #
     # ========================================================================================== #
 
+    # ------------------------------------------------------------------------------------------ #
+    #  Enable-state mirror. A plugin greys parameters out with setParameterEnableStates (C++ API   #
+    #  Common 3) - on the hidden plugin_loader, whose parameters are what the plugin sees. The     #
+    #  mirrored parameters on this COMP copied `enable`/`readOnly` only during a full              #
+    #  sync_custom_parameters (init, reload, Refreshcustompars), so every greying rule a plugin    #
+    #  has stayed invisible on the COMP the user actually edits. Now any edit of a mirrored        #
+    #  parameter queues ONE deferred pass (coalesced: a slider drag queues one per frame at most)  #
+    #  that copies just those two attributes from loader to mirror. No per-frame Python when idle. #
+    # ------------------------------------------------------------------------------------------ #
+    ENABLE_SYNC_DELAY_FRAMES = 2            # the loader cooks with the new value first, then the states are read
+
+    def _schedule_enable_sync(self):
+        if self._enable_sync_pending:
+            return
+        self._enable_sync_pending = True
+        try:
+            run("args[0].ext.PluginBuilderExt._sync_enable_states()", self.ownerComp,
+                group='pb_enable_sync', delayFrames=self.ENABLE_SYNC_DELAY_FRAMES)
+        except Exception:  # noqa: BLE001
+            self._enable_sync_pending = False
+
+    def _sync_enable_states(self):
+        """Copy `enable` and `readOnly` of every mirrored loader parameter onto its COMP mirror.
+
+        Returns how many attributes changed (0 in the steady state: nothing is written then).
+        """
+        self._enable_sync_pending = False
+        loader = self.loader_op
+        if loader is None or not getattr(loader, 'valid', True):
+            return 0
+        changed = 0
+        try:
+            src_pars = loader.pars()
+        except Exception:  # noqa: BLE001
+            return 0
+        for src in src_pars:
+            name = getattr(src, 'name', '')
+            if not name or name.lower() in self.core.BUILTIN_LOADER_PARS:
+                continue
+            if not (getattr(src, 'isCustom', False) or name[0].isupper()):
+                continue
+            dst = getattr(self.ownerComp.par, name, None)
+            if dst is None:
+                continue
+            for attr in ('enable', 'readOnly'):
+                v = getattr(src, attr, None)
+                if v is None or getattr(dst, attr, None) == v:
+                    continue
+                try:
+                    setattr(dst, attr, v)
+                    changed += 1
+                except Exception:  # noqa: BLE001
+                    pass
+        return changed
+
     def OnParValueChange(self, par, prev):
         if par.name in self.on_par_value_change_map:
             self.on_par_value_change_map[par.name](par.eval(), prev)
         elif self.loader_op is not None and getattr(self.loader_op, 'valid', True):
+            # Any mirrored edit can change which parameters the plugin greys out.
+            self._schedule_enable_sync()
             # A mirrored parameter is BIND-linked to the loader, so the bind already carried the value;
             # writing it again would set the loader parameter twice (two parameter-change cooks).
             pm = _par_mode()
