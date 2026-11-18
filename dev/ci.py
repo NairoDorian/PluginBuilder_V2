@@ -10,11 +10,12 @@ Uses PluginBuilderCore exactly like the TouchDesigner extension does: toolchain 
 settings.ini / vswhere, MSVC environment capture, BuildRunner jobs with exit codes and diagnostics.
 Exit code is non-zero on any failure, so it can run in GitHub Actions (windows-latest) as-is.
 
-Pipeline: unittest discover (29 tests) -> scaffold every template into a temp dir
+Pipeline: unittest discover (tests/) -> scaffold every template into a temp dir
 (CMakeBlocks.assemble + render_source + plugin.json) -> discover_toolchain ->
 BuildRunner(capture_vc_env with PLUGINBUILDER_BUILD=1) -> configure+build targets
 (default: BasicCHOP only; --all = every non-CUDA template; --project <dir> = existing
-Plugin_FFT-style projects). Uses the exact same Core entry points as
+Plugin_FFT-style projects, built in their own <dir>/build/ci tree so the project's build/ cache is
+never touched). Uses the exact same Core entry points as
 PluginBuilderExt.build_plugin / compile_plugin.
 """
 
@@ -99,15 +100,33 @@ def run_job(runner, job, timeout=900):
     return done['job']
 
 
-def build_project(runner, project_dir, name, family):
-    """cmake -B build -G Ninja (PLUGIN_BUILDER_DIR=ROOT) then ninja -C build.
+def _default_samples_dir():
+    """TD_SAMPLES_DIR from the environment, else the newest installed TouchDesigner's Samples/CPlusPlus.
+
+    2.2.1: the old default was the unversioned "TouchDesigner/Samples/CPlusPlus", which a 2025+ install
+    (TouchDesigner.<year>.<build>) does not have.
+    """
+    env = os.environ.get('TD_SAMPLES_DIR')
+    if env:
+        return env
+    installs = core.find_td_installs()
+    return os.path.join(installs[0][1], 'Samples', 'CPlusPlus') if installs else ''
+
+
+def build_project(runner, project_dir, name, family, build_dir='build'):
+    """cmake -B <build_dir> -G Ninja (PLUGIN_BUILDER_DIR=ROOT) then ninja -C <build_dir>.
 
     Deploy dir is a throwaway __deploy__ under the project so CI never touches a real
     __Plugins__ next to the user's .toe. On failure, prints parse_diagnostics rows and
-    raises; on success asserts build/bin/Release/<name>.dll exists.
+    raises; on success asserts <build_dir>/bin/Release/<name>.dll exists.
+
+    2.2.1: an EXISTING project (--project) is built in its own build/ci tree. Configuring the project's
+    real build/ with -DPLUGIN_DIR=__deploy__ wrote that into its CMake cache, so every later standalone
+    build of the project silently deployed to __deploy__ instead of __Plugins__/<name> - and TouchDesigner
+    kept loading the stale DLL.
     """
-    samples = os.environ.get('TD_SAMPLES_DIR', 'C:/Program Files/Derivative/TouchDesigner/Samples/CPlusPlus')
-    cfg_args = ['cmake', '-B', 'build', '-G', 'Ninja', f'-DPLUGIN_BUILDER_DIR={ROOT}',
+    samples = _default_samples_dir()
+    cfg_args = ['cmake', '-B', build_dir, '-G', 'Ninja', f'-DPLUGIN_BUILDER_DIR={ROOT}',
                 f'-DPLUGIN_DIR={project_dir}/__deploy__', '-DCMAKE_BUILD_TYPE=Release',
                 '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON']
     if os.path.isdir(samples):
@@ -117,20 +136,20 @@ def build_project(runner, project_dir, name, family):
         for d in core.parse_diagnostics(j.output):
             log(f"  {d['severity']}: {d['file']}({d['line']}): {d['message']}")
         raise RuntimeError(f'configure failed for {name} (exit {j.returncode})')
-    j = run_job(runner, core.BuildJob('build', ['ninja', '-C', 'build'], project_dir, label=f'build {name}'))
+    j = run_job(runner, core.BuildJob('build', ['ninja', '-C', build_dir], project_dir, label=f'build {name}'))
     diags = core.parse_diagnostics(j.output)
     errors, warnings = core.summarize_diagnostics(diags)
     for d in diags:
         log(f"  {d['severity']}: {d['file']}({d['line']}): {d['code']} {d['message']}")
     if not j.ok:
         raise RuntimeError(f'build failed for {name} (exit {j.returncode}, {errors} errors)')
-    dll = os.path.join(project_dir, 'build', 'bin', 'Release', f'{name}.dll')
+    dll = os.path.join(project_dir, build_dir, 'bin', 'Release', f'{name}.dll')
     if not os.path.exists(dll):
         raise RuntimeError(f'{dll} not produced')
     log(f'OK {name}: {os.path.getsize(dll)} bytes in {j.duration_ms:.0f} ms ({warnings} warnings)')
     # Projects with td_plugin_add_test targets: run them (timing gates labelled "perf" excluded).
-    if os.path.exists(os.path.join(project_dir, 'build', 'CTestTestfile.cmake')):
-        t = run_job(runner, core.BuildJob('test', ['ctest', '--test-dir', 'build', '--output-on-failure', '-LE', 'perf'],
+    if os.path.exists(os.path.join(project_dir, build_dir, 'CTestTestfile.cmake')):
+        t = run_job(runner, core.BuildJob('test', ['ctest', '--test-dir', build_dir, '--output-on-failure', '-LE', 'perf'],
                                           project_dir, label=f'ctest {name}'))
         tail = ''.join(t.output[-3:]).strip().replace('\n', ' | ')
         if not t.ok:
@@ -191,7 +210,7 @@ def main():
                 pdir = os.path.abspath(pdir)
                 m = core.read_plugin_manifest(pdir) or {'name': os.path.basename(pdir), 'family': '?'}
                 try:
-                    build_project(runner, pdir, m['name'], m['family'])
+                    build_project(runner, pdir, m['name'], m['family'], build_dir=os.path.join('build', 'ci'))
                 except Exception as e:  # noqa: BLE001
                     log(f'FAILED {pdir}: {e}')
                     rc = 1

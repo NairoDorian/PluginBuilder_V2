@@ -89,6 +89,29 @@ LogLevel = debug
         self.assertEqual(s['errors'], [])
         self.assertEqual(s['paths']['PluginBuilderDir'], '')
 
+    def test_toolchain_discovery_runs_vswhere_only_when_needed(self):
+        """2.2.1: settings.ini naming vcvarsall/ninja/cmake costs no vswhere (two processes, ~250 ms on TD's
+        main thread at every extension init); a missing vcvarsall runs it once, however many tools need it."""
+        d = tempfile.mkdtemp()
+        try:
+            for fn in ('vcvarsall.bat', 'ninja.exe', 'cmake.exe'):
+                open(os.path.join(d, fn), 'w').close()
+            calls = []
+            saved = core.find_visual_studio
+            core.find_visual_studio = lambda: (calls.append(1), (None, None))[1]
+            try:
+                info = core.discover_toolchain({'VCVarsall': os.path.join(d, 'vcvarsall.bat'), 'NinjaDir': d, 'CMakeDir': d})
+                self.assertEqual(calls, [])
+                self.assertEqual(info['sources'], {'vcvarsall': 'settings.ini', 'ninja': 'settings.ini', 'cmake': 'settings.ini'})
+                self.assertEqual(info['errors'], [])
+                info = core.discover_toolchain({'VCVarsall': '', 'NinjaDir': '', 'CMakeDir': ''}, extra_search_dirs=[d])
+                self.assertLessEqual(len(calls), 1)
+                self.assertTrue(any('vcvarsall' in e for e in info['errors']))
+            finally:
+                core.find_visual_studio = saved
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_dev_mode(self):
         s = core.parse_settings('[DevMode]\nx=1\n', 'h')
         self.assertTrue(s['dev_mode'])
@@ -288,6 +311,47 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(results[1][1], 3)
         self.assertIn('boom', results[1][2])
         self.assertGreater(j2.duration_ms, 0)
+
+    @unittest.skipUnless(sys.platform == 'win32', 'job objects are Windows-only')
+    def test_kill_current_kills_the_whole_process_tree(self):
+        """2.2.1: Cancel must stop the grandchildren too (cmd -> ninja -> cl.exe), not only the direct child."""
+        import ctypes
+        import time
+        env = dict(os.environ)
+        runner = core.BuildRunner(lambda: env, capture_output=True, use_job_object=True)
+        runner.start()
+        py = sys.executable
+        script = ('import subprocess, sys, time; '
+                  'p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"]); '
+                  'print("GRANDCHILD", p.pid, flush=True); time.sleep(60)')
+        done = []
+        job = core.BuildJob('custom', [py, '-c', script], os.getcwd(), on_done=lambda j: done.append(j))
+        runner.submit(job)
+        pid, t0 = None, time.time()
+        while pid is None and time.time() - t0 < 30:
+            for ev in runner.poll():
+                if ev[0] == 'line' and ev[2].startswith('GRANDCHILD'):
+                    pid = int(ev[2].split()[1])
+            time.sleep(0.02)
+        self.assertIsNotNone(pid, 'the child never reported its grandchild')
+        self.assertTrue(runner.kill_current())
+        t0 = time.time()
+        while not done and time.time() - t0 < 30:
+            runner.poll()
+            time.sleep(0.02)
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        h = k32.OpenProcess(0x00100000, False, pid)          # SYNCHRONIZE
+        gone = True
+        if h:
+            gone = k32.WaitForSingleObject(h, 5000) == 0       # WAIT_OBJECT_0: it exited
+            k32.CloseHandle(h)
+        runner.shutdown()
+        self.assertTrue(done, 'the killed job never reported done')
+        self.assertTrue(gone, 'the grandchild process survived Cancel')
 
     def test_env_failure_is_reported(self):
         """env_factory raising (e.g. missing vcvarsall) emits ('env', False, msg) as the first event."""
@@ -489,7 +553,8 @@ class ParamGenTests(unittest.TestCase):
                 self.assertTrue(os.path.exists(os.path.join(d, rel)), rel)
             with open(os.path.join(d, 'source', 'Meter.cpp'), encoding='utf-8') as f:
                 text = f.read()
-            self.assertIn('#include "MeterCore.h"', open(os.path.join(d, 'source', 'Meter.h'), encoding='utf-8').read())
+            with open(os.path.join(d, 'source', 'Meter.h'), encoding='utf-8') as f:
+                self.assertIn('#include "MeterCore.h"', f.read())
             self.assertIn('opType->setString("Meter")', text)
             lines = core.template_cmake_lines(meta, 'Meter')
             self.assertIn('td_plugin_optimize(Meter REALTIME)', lines)

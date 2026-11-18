@@ -245,47 +245,61 @@ def discover_toolchain(settings_paths, extra_search_dirs=()):
     Called from PluginBuilderExt.check_paths and dev/ci.py:main.
     """
     info = {'vcvarsall': '', 'ninja_dir': '', 'cmake_dir': '', 'vs_path': '', 'sources': {}, 'errors': []}
-    vs_path, vs_name = find_visual_studio()
-    info['vs_path'] = vs_path or ''
+    # 2.2.1: vswhere is run only when something actually needs the Visual Studio location. It is two
+    # child processes (~250 ms measured) and this runs on TouchDesigner's main thread at every extension
+    # init, so a settings.ini that names its tools (or tools on PATH) now costs no vswhere at all.
+    _vs = {}
+
+    def vs():
+        if 'path' not in _vs:
+            _vs['path'], _vs['name'] = find_visual_studio()
+            info['vs_path'] = _vs['path'] or ''
+        return _vs['path'], _vs['name']
 
     # vcvarsall
     cand = settings_paths.get('VCVarsall', '')
     if cand and os.path.exists(cand):
         info['vcvarsall'], info['sources']['vcvarsall'] = cand, 'settings.ini'
-    elif vs_path and os.path.exists(os.path.join(vs_path, 'VC', 'Auxiliary', 'Build', 'vcvarsall.bat')):
-        info['vcvarsall'] = os.path.join(vs_path, 'VC', 'Auxiliary', 'Build', 'vcvarsall.bat')
-        info['sources']['vcvarsall'] = f'vswhere ({vs_name})'
     else:
-        info['errors'].append('vcvarsall.bat not found (install Visual Studio C++ tools or set [Paths] VCVarsall).')
+        vs_path, vs_name = vs()
+        if vs_path and os.path.exists(os.path.join(vs_path, 'VC', 'Auxiliary', 'Build', 'vcvarsall.bat')):
+            info['vcvarsall'] = os.path.join(vs_path, 'VC', 'Auxiliary', 'Build', 'vcvarsall.bat')
+            info['sources']['vcvarsall'] = f'vswhere ({vs_name})'
+        else:
+            info['errors'].append('vcvarsall.bat not found (install Visual Studio C++ tools or set [Paths] VCVarsall).')
 
     # ninja
     cand = settings_paths.get('NinjaDir', '')
-    bundled_ninja = os.path.join(vs_path, 'Common7', 'IDE', 'CommonExtensions', 'Microsoft', 'CMake', 'Ninja') if vs_path else ''
     which_ninja = shutil.which('ninja')
     if cand and os.path.exists(os.path.join(cand, 'ninja.exe')):
         info['ninja_dir'], info['sources']['ninja'] = cand, 'settings.ini'
     elif which_ninja:
         info['ninja_dir'], info['sources']['ninja'] = os.path.dirname(which_ninja), 'PATH'
-    elif bundled_ninja and os.path.exists(os.path.join(bundled_ninja, 'ninja.exe')):
-        info['ninja_dir'], info['sources']['ninja'] = bundled_ninja, 'Visual Studio bundled'
     else:
-        for d in extra_search_dirs:
-            if os.path.exists(os.path.join(d, 'ninja.exe')):
-                info['ninja_dir'], info['sources']['ninja'] = d, 'search dir'
-                break
+        vs_path, _ = vs()
+        bundled_ninja = os.path.join(vs_path, 'Common7', 'IDE', 'CommonExtensions', 'Microsoft', 'CMake', 'Ninja') if vs_path else ''
+        if bundled_ninja and os.path.exists(os.path.join(bundled_ninja, 'ninja.exe')):
+            info['ninja_dir'], info['sources']['ninja'] = bundled_ninja, 'Visual Studio bundled'
+        else:
+            for d in extra_search_dirs:
+                if os.path.exists(os.path.join(d, 'ninja.exe')):
+                    info['ninja_dir'], info['sources']['ninja'] = d, 'search dir'
+                    break
     if not info['ninja_dir']:
         info['errors'].append('ninja.exe not found (install Ninja, add it to PATH, or set [Paths] NinjaDir).')
 
     # cmake (optional: vcvarsall usually adds the VS-bundled CMake to PATH)
     cand = settings_paths.get('CMakeDir', '')
-    bundled_cmake = os.path.join(vs_path, 'Common7', 'IDE', 'CommonExtensions', 'Microsoft', 'CMake', 'CMake', 'bin') if vs_path else ''
     which_cmake = shutil.which('cmake')
     if cand and os.path.exists(os.path.join(cand, 'cmake.exe')):
         info['cmake_dir'], info['sources']['cmake'] = cand, 'settings.ini'
     elif which_cmake:
         info['cmake_dir'], info['sources']['cmake'] = os.path.dirname(which_cmake), 'PATH'
-    elif bundled_cmake and os.path.exists(os.path.join(bundled_cmake, 'cmake.exe')):
-        info['cmake_dir'], info['sources']['cmake'] = bundled_cmake, 'Visual Studio bundled'
+    else:
+        vs_path, _ = vs()
+        bundled_cmake = os.path.join(vs_path, 'Common7', 'IDE', 'CommonExtensions', 'Microsoft', 'CMake', 'CMake', 'bin') if vs_path else ''
+        if bundled_cmake and os.path.exists(os.path.join(bundled_cmake, 'cmake.exe')):
+            info['cmake_dir'], info['sources']['cmake'] = bundled_cmake, 'Visual Studio bundled'
     return info
 
 
@@ -1014,7 +1028,13 @@ def render_vscode_files(plugin_name, td_exe, toe_path, project_folder, sdk_inclu
 # section reads as one unit (same value, harmless duplicate at class scope).
 
 class WindowsJobObject:
-    """Kill-on-close job object so cmake/ninja/cl children die with the runner (Windows only, best effort)."""
+    """Kill-on-close job object so cmake/ninja/cl children die with the runner (Windows only, best effort).
+
+    2.2.1: the kernel32 calls carry explicit ctypes signatures. Without them ctypes passes and returns
+    HANDLEs as 32-bit C ints - it only worked because handle values happen to be small. terminate()
+    kills every process in the job (the running build's whole tree: cmd -> cmake/ninja -> cl.exe), which
+    is what Cancel Build needs; Popen.kill() alone stopped only the direct child and left cl.exe running.
+    """
 
     def __init__(self):
         self.handle = None
@@ -1023,7 +1043,19 @@ class WindowsJobObject:
         try:
             import ctypes
             from ctypes import wintypes
-            k32 = ctypes.windll.kernel32
+            k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            k32.CreateJobObjectW.restype = wintypes.HANDLE
+            k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+            k32.SetInformationJobObject.restype = wintypes.BOOL
+            k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+            k32.AssignProcessToJobObject.restype = wintypes.BOOL
+            k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            k32.TerminateJobObject.restype = wintypes.BOOL
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            k32.CloseHandle.restype = wintypes.BOOL
             self._k32 = k32
             self.handle = k32.CreateJobObjectW(None, None)
             if not self.handle:
@@ -1065,6 +1097,19 @@ class WindowsJobObject:
             ok = bool(self._k32.AssignProcessToJobObject(self.handle, h))
             self._k32.CloseHandle(h)
             return ok
+        except Exception:  # noqa: BLE001
+            return False
+
+    def terminate(self, exit_code=1):
+        """Kill every process currently in the job (the job object itself stays usable). True on success.
+
+        The runner runs one job at a time, and a finished build's processes have already left the job,
+        so this is exactly "the running build's process tree".
+        """
+        if not self.handle:
+            return False
+        try:
+            return bool(self._k32.TerminateJobObject(self.handle, int(exit_code)))
         except Exception:  # noqa: BLE001
             return False
 
@@ -1226,8 +1271,16 @@ class BuildRunner:
         return n
 
     def kill_current(self):
+        """Stop the running subprocess job and its whole process tree. True when something was running.
+
+        2.2.1: with a job object, TerminateJobObject kills the tree (cmd -> cmake/ninja -> cl.exe / link.exe).
+        Popen.kill() alone stopped only the direct child, so Cancel Build left the compilers running (holding
+        .obj/.pdb locks the next build then tripped over) until the runner itself shut down.
+        """
         p = self._proc
         if p is not None and p.poll() is None:
+            if self._job_obj is not None:
+                self._job_obj.terminate()
             try:
                 p.kill()
             except Exception:  # noqa: BLE001

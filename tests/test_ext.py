@@ -266,5 +266,54 @@ class ExtMirrorTests(unittest.TestCase):
         self.assertGreater(restored, 0)
 
 
+class UnloadingLoader(FakeOp):
+    """A loader whose custom parameters disappear while unloaded (so a reload needs no node recreate) and
+    whose cook throws when asked to map `fail_path` - a DLL that cannot be loaded."""
+    fail_path = None
+
+    def pars(self):
+        if self.par.__dict__.get('unloadplugin') is True:
+            return [p for p in self._pars.values() if not p.isCustom]
+        return super().pars()
+
+    def cook(self, force=False):
+        super().cook(force)
+        if self.par.__dict__.get('unloadplugin') is False and self.par.__dict__.get('plugin') == self.fail_path:
+            raise RuntimeError('cannot map the DLL')
+
+
+class ExtReloadTests(unittest.TestCase):
+    """2.2.1: _reload_loader_fresh says whether the new DLL loaded; a rollback must not count as loaded."""
+    def _make(self, fail_path):
+        mod = import_ext()
+        owner = FakeOp('PluginBuilder')
+        loader = UnloadingLoader('plugin_loader')
+        loader.fail_path = fail_path
+        pg = loader.appendCustomPage('Spectrum')
+        pg.appendFloat('Gain', label='Gain')
+        loader.par.Gain.val = 0.25
+        loader._pars['plugin'] = FakePar('plugin', 'File', pg)
+        loader.par.plugin.val = 'old.dll'
+        owner._children['plugin_loader'] = loader
+        return make_ext(mod, owner), loader
+
+    def test_successful_reload_returns_true(self):
+        ext, loader = self._make(fail_path=None)
+        self.assertTrue(ext._reload_loader_fresh('new.dll'))
+        self.assertEqual(loader.par.plugin, 'new.dll')
+        self.assertEqual(loader.par.Gain.val, 0.25)          # value restored after the reload
+
+    def test_failed_reload_rolls_back_and_returns_false(self):
+        ext, loader = self._make(fail_path='new.dll')
+        self.assertFalse(ext._reload_loader_fresh('new.dll'))
+        self.assertEqual(loader.par.plugin, 'old.dll')        # rolled back to the DLL that was working
+        self.assertIs(loader.par.unloadplugin, False)         # and left loaded
+
+    def test_missing_loader_returns_false(self):
+        mod = import_ext()
+        ext = make_ext(mod, FakeOp('PluginBuilder'))
+        self.assertFalse(ext._reload_loader_fresh('new.dll'))
+
+
 if __name__ == '__main__':
     unittest.main()

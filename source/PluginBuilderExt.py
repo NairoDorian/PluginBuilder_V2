@@ -40,8 +40,9 @@ SOFTWARE.
 # Contracts: PLUGIN_BUILDER_DIR / td_add_plugin / __Plugins__ deploy / PLUGINBUILDER_BUILD=1
 # env and plugin.json schema live in PluginBuilderCore + cmake/TDPlugin.cmake; this file is
 # the TD-only surface. Sibling repo ../Plugin_FFT is a consumer of that contract (never
-# modified here). Known facts: API 10 headers, CMake+Ninja+MSVC, v2.1.4; v2.1.1 added the
-# hot-reload parameter-definition refresh (_reload_loader_fresh).
+# modified here). Known facts: CHOP API 10 / Common API 3 headers (TD 2025.33230), CMake+Ninja+MSVC,
+# PluginBuilder 2.2.x (see CHANGELOG.md); v2.1.1 added the hot-reload parameter-definition refresh
+# (_reload_loader_fresh), 2.2.0 the live enable-state mirror (_sync_enable_states).
 # =================================================================================================
 
 import importlib.util
@@ -986,7 +987,10 @@ class PluginBuilderExt:
                 old.destroy()
             node = parent.create(type(loader), name)
             node.nodeX, node.nodeY = self.ownerComp.nodeX + 200, self.ownerComp.nodeY - 150
-            dll = os.path.abspath(f"{project.folder}/{self.plugin_dir}/{self.Pluginname}.dll").replace('\\', '/')
+            # 2.2.1: project-relative, like plugin_loader. The absolute path that was written here broke the
+            # baked node as soon as the .toe moved to another folder or machine (TD resolves a relative path
+            # against project.folder).
+            dll = f"{self.plugin_dir}/{self.Pluginname}.dll"
             node.par.plugin = dll
             node.par.unloadplugin = False
             node.cook(force=True)
@@ -1775,13 +1779,14 @@ class PluginBuilderExt:
 
         Steps (numbered in-body): 1 unload+cook, 2 recreate if custom pars survived,
         3 map new DLL, 4 reinit pulse, 5 restore snapshot + log parameter_definition_diff.
-        Every path ends in _ensure_loader_live().
+        Every path ends in _ensure_loader_live(). Returns True when plugin_path is now loaded, False when the
+        reload was skipped or rolled back (2.2.1: the caller records the DLL hash only on True).
         """
         # Re-resolve in case the COMP was edited underneath us between schedule and cook.
         self.loader_op = self.ownerComp.op('plugin_loader')
         if self.loader_op is None or not getattr(self.loader_op, 'valid', True):
             self._set_error('Reload skipped: plugin_loader node not found.')
-            return
+            return False
 
         before = {p.name: tuple(getattr(p, 'menuNames', ()) or ()) for p in self._custom_loader_pars()}
         snapshot = self._snapshot_loader_values()
@@ -1834,7 +1839,7 @@ class PluginBuilderExt:
             except Exception as e3:  # noqa: BLE001
                 self._debug('Reload', f'rollback value restore failed: {e3}')
             self._ensure_loader_live()
-            return
+            return False
         # 5. Put the user's values / expressions / bindings back
         restored, skipped = self._restore_loader_values(snapshot)
         after = {p.name: tuple(getattr(p, 'menuNames', ()) or ()) for p in self._custom_loader_pars()}
@@ -1846,6 +1851,7 @@ class PluginBuilderExt:
         # Last step on every path through a reload, including the rollback above: leave the loader both
         # loaded and cooking, rather than trusting each caller to have done it.
         self._ensure_loader_live()
+        return True
 
     def _do_copy_plugin(self, force=False):
         """
@@ -1933,7 +1939,11 @@ class PluginBuilderExt:
                 self._debug('Build→Copy', f"  runtime {n}")
             self._log('Build→Copy', f"{os.path.basename(plugin_path)}: {r.get('note')} ({r.get('size')} bytes, "
                                     f"staged off-thread in {r.get('ms', 0.0):.1f} ms)")
-            self._reload_loader_fresh(plugin_path)
+            if not self._reload_loader_fresh(plugin_path):
+                # 2.2.1: a rolled-back reload must not record this hash as loaded, or the next copy of the
+                # very same DLL would be skipped as "unchanged" although it never loaded.
+                self._loaded_dll_hash = None
+                return
             self._loaded_dll_hash = r.get('hash')
             try:
                 self.ownerComp.par.Loadeddll = f"{os.path.basename(plugin_path)} @ {time.strftime('%H:%M:%S')}"
@@ -2078,7 +2088,8 @@ class PluginBuilderExt:
         self._poll()
 
     def GetOutput(self):
-        """Pop queued stdout lines from the runner (does not run on_done side effects beyond poll)."""
+        """Pop queued stdout lines from the runner. Note: runner.poll() also dispatches on_done callbacks
+        of jobs that finished (exactly as _poll() would), so this is not a side-effect-free peek."""
         lines = []
         if self.runner is not None:
             for ev in self.runner.poll():

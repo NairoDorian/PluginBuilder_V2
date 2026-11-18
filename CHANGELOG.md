@@ -10,6 +10,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [2.2.1] - 2026-11-18
+
+Release-prep audit of both repositories: `../RELEASE_AUDIT_2026-11-18.md`.
+
+### Fixed
+- **A failed hot reload no longer counts as loaded.** `_do_copy_plugin` recorded the new DLL's hash after
+  `_reload_loader_fresh` even when that rolled back to the previous DLL, so the next copy of the very same DLL was
+  skipped as "unchanged" although it had never loaded. `_reload_loader_fresh` now returns whether the new DLL
+  loaded, and the hash is recorded only then.
+- **Cancel Build kills the whole build.** `BuildRunner.kill_current()` killed only the direct child; cmake / ninja /
+  cl.exe kept running (holding `.obj` / `.pdb` locks) until the runner shut down, and the orphans kept the output
+  pipe open, so the cancelled job could not even report done. It now terminates the job object, i.e. the
+  running build's whole process tree.
+- **`WindowsJobObject` declares its kernel32 signatures** (a private `ctypes.WinDLL`, so no other Python in the
+  TouchDesigner process is affected). HANDLEs were passed and returned as 32-bit C ints.
+- **`dev/ci.py --project` no longer reconfigures the project's own `build/`.** It passed
+  `-DPLUGIN_DIR=<project>/__deploy__`, which stayed in that build tree's CMake cache: every later standalone build
+  of the project then deployed to `__deploy__` instead of `__Plugins__/<name>`, and TouchDesigner kept loading a stale
+  DLL. Existing projects are now built in `<project>/build/ci`. Its `TD_SAMPLES_DIR` default is the newest
+  installed TouchDesigner (`find_td_installs`) instead of an unversioned path a 2025 install does not have.
+- **Bake for Performance writes a project-relative DLL path**, like `plugin_loader`. The absolute path broke the
+  baked node as soon as the `.toe` moved to another folder or machine.
+
+### Changed
+- **`vswhere` runs only when it is needed.** Toolchain discovery ran it (two child processes, ~250 ms measured) on
+  TouchDesigner's main thread at every extension init, even when settings.ini named every tool. It now runs only
+  when a tool is missing from settings.ini / PATH, and at most once.
+
+### Tests
+- 51 unit tests (46 + 5): Cancel kills a grandchild process (Windows; the test fails against the 2.2.0 behaviour),
+  `vswhere` is skipped / run once, and three Ext reload tests (success → True, a rolled-back load → False with the
+  previous DLL restored and loaded, no loader → False). A pre-existing unclosed-file `ResourceWarning` in the
+  RealtimeCHOP scaffold test is fixed; the suite is clean under `-W error::ResourceWarning`.
+- `dev/ci.py --all`: every non-CUDA template builds with 0 warnings on MSVC 14.52.37025; RealtimeCHOP's ctest passes.
+  `dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT`: build (0 warnings) + ctest pass.
+
+### Still open
+- `PluginBuilder.tox` (2024-04-20) and `dev/dev.toe` (2024-07-08) still need a re-export from a live session
+  (`dev/deploy.py`). This is the release blocker for distributing the `.tox`.
+- The live enable-state mirror (2.2.0) is still not confirmed in TouchDesigner.
+
+---
+
 ## [2.2.0] - 2026-11-08
 
 ### Added
@@ -45,7 +88,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
-## [Unreleased] - 2026-09-22
+## [docs] - 2026-09-22 — documentation pass (shipped in `24b8ff5`; no version bump)
 
 ### Documentation
 - **Docs refresh pass.** README and AUDIT brought up to date with the code as of 2.1.4:

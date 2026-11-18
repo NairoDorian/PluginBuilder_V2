@@ -16,13 +16,22 @@ swaps the new DLL into the running `.toe` without an unload gap, mirrors the plu
 (pages preserved) onto the PluginBuilder COMP, and reports build results (status, timings, parsed compiler
 errors) on the COMP itself.
 
-V2 compiles against the **C++ API 10** headers shipped with TouchDesigner 2025.30000+ (`include/`,
-synced from the installed `Samples/CPlusPlus` by `dev/sync_templates.py`) and warns when the running
-TouchDesigner ships a different SDK version.
+V2 compiles against the **CHOP API 10 / Common API 3** headers of TouchDesigner **2025.33230** (`include/`,
+synced from the installed `Samples/CPlusPlus` by `dev/sync_templates.py`; see `include/sdk_versions.json`) and
+warns when the running TouchDesigner ships a different SDK version.
+
+> **Release status (2026-11-18).** The Python, CMake and templates are release-ready (51 unit tests, every
+> non-CUDA template builds warning-free on MSVC 14.52, the Plugin_FFT cross-repo build passes). **`PluginBuilder.tox`
+> is not**: it is still the 2024 upstream export and must be re-exported from a live session with
+> `dev/deploy.py` (which checks that the `PluginBuilderExt` / `PluginBuilderCore` / `CMakeBlocks` DATs are
+> file-linked to `source/`) before it is distributed. See `../RELEASE_AUDIT_2026-11-18.md`.
 
 ## Requirements
 
-- **TouchDesigner** 2025.30000 or newer (commercial / pro / educational license — CPlusPlus operators).
+- **TouchDesigner** 2025.33230 (the build the headers were synced from; tested). Other 2025 builds should work —
+  `setParameterEnableStates` (Common API 3) occupies a former reserved vtable slot — but are untested; the extension
+  warns when the running TouchDesigner's SDK version differs. Commercial / pro / educational license (CPlusPlus
+  operators).
 - **Visual Studio** 2022 or 2026 with the *Desktop development with C++* workload (found automatically via `vswhere`).
 - **CMake** ≥ 3.21 and **Ninja** — the copies bundled with Visual Studio's *C++ CMake tools* component are
   found automatically; otherwise put them on `PATH` or set the paths in `settings.ini`.
@@ -56,8 +65,9 @@ TouchDesigner ships a different SDK version.
    TouchDesigner kept the old parameter objects, load, restore every value / expression / binding) — so changed
    menu entries, labels and ranges appear without restarting TouchDesigner. Custom parameters are mirrored onto
    the COMP with their original pages and BIND expressions.
-6. **Status** page: `Build Status`, `Last Build`, `Loaded DLL`, `Cancel Build`, `Clean Build Dir`,
-   `Force Reload Plugin`, `Run Tests (ctest)`. Compiler diagnostics are parsed into `builder/build_errors`
+6. **Status** page: `Build Status`, `Last Build`, `Loaded DLL`, `Cancel Build` (kills the whole build process
+   tree), `Clean Build Dir`, `Force Reload Plugin`, `Run Tests (ctest)`, `Generate Parameters (parameters.json)`
+   (ParamGen) and `Bake for Performance` (a standalone `cplusplus` node with constant parameters, for shows). Compiler diagnostics are parsed into `builder/build_errors`
    (severity, file, line, code, message) and the first error is shown as a COMP error.
 7. **Install Plugin** copies `__Plugins__/<Name>/` to `Documents/Derivative/Plugins/<Name>/`.
 
@@ -87,9 +97,9 @@ See `cmake/TDPlugin.cmake` for the full list and the `TD_PLUGIN_WARNINGS` / `TD_
 ## Development
 
 ```
-python -m unittest discover -s tests -v      # 29 headless tests for source/PluginBuilderCore.py
+python -m unittest discover -s tests -v      # 51 headless tests (Core + the Ext against a fake TD surface)
 python dev/ci.py --all                       # + scaffold every template and build the non-CUDA ones
-python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT   # cross-repo: configure + build the sibling FFT CHOP
+python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT   # cross-repo: build + ctest the FFT CHOP in its build/ci tree
 python dev/sync_templates.py                 # resync SDK headers + templates from the installed TouchDesigner
 ```
 `source/PluginBuilderCore.py` holds all TouchDesigner-independent logic (naming, settings, toolchain
@@ -107,9 +117,10 @@ re-exports `PluginBuilder.tox`.
 | `source/CMakeBlocks.py` | Emits the ~15-line generated `CMakeLists.txt` (header comment + `include(TDPlugin.cmake)` + `td_add_plugin`) |
 | `cmake/TDPlugin.cmake` | The shared CMake module every generated project includes: `td_add_plugin`, `td_plugin_use_*` (fftw3 / cuda / python / opencv), `td_plugin_optimize`, runtime-DLL staging, test/bench targets |
 | `cmake/TDDeploy.cmake` | Rename-in-place post-build deploy for *standalone* (non-PluginBuilder) builds — same trick the extension uses at runtime |
-| `templates/*/` | Eight scaffolds (BasicCHOP, CHOPWithPythonClass, BasicDAT, CPUMemoryTOP, CudaTOP, SimpleShapesPOP, CudaPOP, SimpleShapesSOP); each is `template.json` + `source/` with `#__OP_*__#` placeholders |
-| `include/` | Vendored Derivative C++ SDK headers (API 10) + `sdk_versions.json` |
-| `tests/test_core.py` | 29 unittest methods against Core only (Ext is TD-dependent and covered by `ci.py`) |
+| `templates/*/` | Nine scaffolds (BasicCHOP, CHOPWithPythonClass, BasicDAT, CPUMemoryTOP, CudaTOP, SimpleShapesPOP, CudaPOP, SimpleShapesSOP, **RealtimeCHOP** — the lock-free worker + triple-buffer pattern with tests, bench and a ParamGen spec); each is `template.json` + `source/` with `#__OP_*__#` placeholders, plus a `NOTES.md` |
+| `include/` | Vendored Derivative C++ SDK headers (CHOP API 10, Common API 3; TD 2025.33230) + `sdk_versions.json` |
+| `source/ParamGen.py` | `parameters.json` → `Parameters.h/.cpp` (names, enum menus, one `eval()` per cook, clamps, `enable_if`) |
+| `tests/` | `test_core.py` (Core) and `test_ext.py` (the Ext against a fake TouchDesigner surface: mirroring, enable-state sync, reload snapshot/restore and rollback) |
 | `dev/` | `ci.py` (headless scaffold+build), `sync_templates.py` (re-import SDK + templates from TD), `deploy.py` (re-export `.tox`), `settings_template.ini` |
 
 ## Relationship to Plugin_FFT
@@ -124,7 +135,7 @@ re-exports `PluginBuilder.tox`.
 | `td_plugin_optimize(FFT AVX2 FAST_MATH LTO)` | `/O2 /Oi /Ot /Gy /arch:AVX2 /fp:fast /GL /LTCG` |
 | `plugin.json` manifest | Declares family `CHOP`, optype `Fftcustom`, deps — reopened when you type `FFT` as the plugin name |
 | `__Plugins__/FFT/` + rename-in-place swap | Standalone `_b.bat` and PluginBuilder hot-reload both deploy `FFT.dll` + `libfftw3f-*.dll` there; TD loads from this path |
-| `dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT` | Cross-repo configure + build used as a smoke test |
+| `dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT` | Cross-repo configure + build + ctest used as a smoke test, in the project's own `build/ci` tree (2.2.1: it used to reconfigure the project's real `build/` and leave `PLUGIN_DIR=__deploy__` in its cache) |
 | Hot-reload parameter refresh (2.1.1) | Discovered while iterating on FFT's `Planner = Patient` menu entry — TD keeps stale par objects across re-init, so Ext now unloads, recreates the loader, reloads, and restores values |
 
 Plugin_FFT's own docs (README, CHANGELOG, optimization analysis, roadmap) describe the *DSP* side;
