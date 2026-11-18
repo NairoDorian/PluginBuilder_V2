@@ -10,6 +10,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [2.2.2] - 2026-11-19
+
+### Changed
+- **`PluginBuilder_V2.tox` is the distributable.** It was re-exported from a live V2 session (2.2.1); the 2024
+  upstream `PluginBuilder.tox` is removed from the tree (it is in git history) so nobody installs the stale one.
+  `dev/deploy.py` now writes `PluginBuilder_V2.tox`; the README points to it.
+
+### Fixed
+- **Cancel no longer misses a job the worker has just dequeued.** `cancel_pending()` decided from what was still
+  in the queue; a job taken by the worker but not yet started escaped and ran. It now cancels everything in
+  `_pending` under the lock, and a shutdown sentinel found in the queue is put back.
+- **Re-baking keeps the baked node's wires and position.** Bake for Performance destroyed an existing
+  `<name>_baked` and created an unwired one at the default position, silently disconnecting a show from the
+  plugin. Wires in and out are now restored (the connector calls `_recreate_loader_node` uses) and the log says
+  how many.
+
+### Added
+- **Licensing:** your copyright line in `LICENSE` (MIT) for the V2 work, and `THIRD_PARTY_NOTICES.md` — what the
+  MIT license does *not* cover: `include/` and the Derivative-sample templates (Derivative's Shared Use License),
+  `3rdParty/opencv` (OpenCV 4.8.0, Apache-2.0) and `3rdParty/Python` (CPython 3.11, PSF License).
+
+### Tests
+- 53 unit tests (+2: the dequeued-job cancel, and a re-bake that must keep position and both wires, against a
+  wired fake network).
+
+---
+
 ## [2.2.1] - 2026-11-18
 
 Release-prep audit of both repositories: `../RELEASE_AUDIT_2026-11-18.md`.

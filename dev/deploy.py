@@ -3,19 +3,19 @@ deploy.py — PluginBuilder release packaging (run from inside dev/dev.toe).
 
 Resets the PluginBuilder COMP to a clean default state, verifies that the code DATs are
 file-synced to ../source/*.py (so the .tox never ships stale embedded copies), strips
-__pycache__ folders, and exports ../PluginBuilder.tox.
+__pycache__ folders, and exports ../PluginBuilder_V2.tox.
 
 Run inside dev/dev.toe (Text DAT with file sync or pasted execute). Uses TD globals
 (op, project) — not importable headlessly. Steps mirror the numbered comments below:
 (1) verify DAT.par.file points at source/*.py so the .tox never ships a stale embed,
 (2) reset creation/status parameters to defaults, (3) drop __pycache__ under the repo
-root, (4) save ../PluginBuilder.tox. Warnings print but do not abort the export.
+root, (4) save ../PluginBuilder_V2.tox. Warnings print but do not abort the export.
 """
 
 import os
 import shutil
 
-print('[Deploy] Packaging PluginBuilder.tox release component...')
+print('[Deploy] Packaging PluginBuilder_V2.tox release component...')
 
 # TD globals available inside the .toe: op() resolves a sibling/child COMP by name.
 PluginBuilderComp = op('PluginBuilder')
@@ -65,6 +65,6 @@ for dirpath, dirnames, _files in os.walk(root):
     if '__pycache__' in dirnames:
         shutil.rmtree(os.path.join(dirpath, '__pycache__'), ignore_errors=True)
 
-# 4. Export — relative to project.folder, i.e. PluginBuilder_V2/PluginBuilder.tox
-PluginBuilderComp.save('../PluginBuilder.tox')
-print('[Deploy] Successfully exported PluginBuilder.tox' + (' (with warnings)' if problems else ''))
+# 4. Export — relative to project.folder, i.e. PluginBuilder_V2/PluginBuilder_V2.tox
+PluginBuilderComp.save('../PluginBuilder_V2.tox')
+print('[Deploy] Successfully exported PluginBuilder_V2.tox' + (' (with warnings)' if problems else ''))

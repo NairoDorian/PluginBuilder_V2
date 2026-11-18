@@ -1254,18 +1254,30 @@ class BuildRunner:
             return [j.kind for j in self._pending]
 
     def cancel_pending(self):
-        n = 0
+        """Cancel every job submitted but not started yet. Returns how many were cancelled.
+
+        2.2.2: the cancellation is decided from `_pending` under the lock, not from what is still in the queue.
+        A job the worker had already taken out of the queue but not yet started (between `_jobs.get()` and its
+        `_pending` bookkeeping) used to escape the cancel and run anyway; now it is marked cancelled here and the
+        worker skips it. A shutdown sentinel found in the queue is put back.
+        """
+        sentinel = False
         try:
             while True:
-                j = self._jobs.get_nowait()
-                if j is not None:
+                if self._jobs.get_nowait() is None:
+                    sentinel = True
+        except queue.Empty:
+            pass
+        if sentinel:
+            self._jobs.put(None)
+        n = 0
+        with self._lock:
+            for j in self._pending:
+                if not j.cancelled:
                     j.cancelled = True
                     j.returncode = -2
                     self._events.put(('done', j))
                     n += 1
-        except queue.Empty:
-            pass
-        with self._lock:
             self.pending_count = 0
             self._pending.clear()
         return n

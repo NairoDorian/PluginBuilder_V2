@@ -20,11 +20,12 @@ V2 compiles against the **CHOP API 10 / Common API 3** headers of TouchDesigner 
 synced from the installed `Samples/CPlusPlus` by `dev/sync_templates.py`; see `include/sdk_versions.json`) and
 warns when the running TouchDesigner ships a different SDK version.
 
-> **Release status (2026-11-18).** The Python, CMake and templates are release-ready (51 unit tests, every
-> non-CUDA template builds warning-free on MSVC 14.52, the Plugin_FFT cross-repo build passes). **`PluginBuilder.tox`
-> is not**: it is still the 2024 upstream export and must be re-exported from a live session with
-> `dev/deploy.py` (which checks that the `PluginBuilderExt` / `PluginBuilderCore` / `CMakeBlocks` DATs are
-> file-linked to `source/`) before it is distributed. See `../RELEASE_AUDIT_2026-11-18.md`.
+> **Release status (2.2.2, 2026-11-19).** `PluginBuilder_V2.tox` is the component to use: re-exported from a
+> live V2 session (the 2024 upstream `PluginBuilder.tox` is gone from the tree). The Python, CMake and templates
+> are covered by the unit tests, every non-CUDA template builds warning-free on MSVC 14.52, and the Plugin_FFT
+> cross-repo build passes. `dev/deploy.py` re-exports the `.tox` and checks that its `PluginBuilderExt` /
+> `PluginBuilderCore` / `CMakeBlocks` DATs are file-linked to `source/`. License: MIT
+> ([`LICENSE`](LICENSE)); vendored third-party material: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
 
 ## Requirements
 
@@ -46,7 +47,7 @@ warns when the running TouchDesigner ships a different SDK version.
 
 ## Usage
 
-1. Drag `PluginBuilder.tox` into a TouchDesigner project **saved on disk**.
+1. Drag `PluginBuilder_V2.tox` into a TouchDesigner project **saved on disk**.
 2. Enter a **Plugin Name** (letters, digits, `_`; it becomes the CMake target, class name and DLL name — the
    TouchDesigner opType is derived and validated automatically, e.g. `FFT` → `Fft`, with a collision check
    against built-in operators).
@@ -97,7 +98,7 @@ See `cmake/TDPlugin.cmake` for the full list and the `TD_PLUGIN_WARNINGS` / `TD_
 ## Development
 
 ```
-python -m unittest discover -s tests -v      # 51 headless tests (Core + the Ext against a fake TD surface)
+python -m unittest discover -s tests -v      # 53 headless tests (Core + the Ext against a fake TD surface)
 python dev/ci.py --all                       # + scaffold every template and build the non-CUDA ones
 python dev/ci.py --project ../Plugin_FFT/PluginProjects/FFT   # cross-repo: build + ctest the FFT CHOP in its build/ci tree
 python dev/sync_templates.py                 # resync SDK headers + templates from the installed TouchDesigner
@@ -106,7 +107,7 @@ python dev/sync_templates.py                 # resync SDK headers + templates fr
 discovery, templates, manifests, diagnostics parsing, the build runner, hot-swap file replacement);
 `source/PluginBuilderExt.py` is the thin TouchDesigner adapter. The extension loads both from disk under
 `PluginBuilderDir/source`, so the `.tox` always runs the current code. `dev/deploy.py` (run inside `dev/dev.toe`)
-re-exports `PluginBuilder.tox`.
+re-exports `PluginBuilder_V2.tox`.
 
 ### Source map (where to look first)
 

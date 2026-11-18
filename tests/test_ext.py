@@ -315,5 +315,67 @@ class ExtReloadTests(unittest.TestCase):
         self.assertFalse(ext._reload_loader_fresh('new.dll'))
 
 
+class FakeConnector:
+    def __init__(self, op):
+        self.op, self.connections = op, []
+
+    def connect(self, other):
+        self.connections.append(other)
+        other.connections.append(self)
+
+
+class WiredOp(FakeOp):
+    """FakeOp with a parent, a position, one input / one output connector and create()."""
+    def __init__(self, name, parent=None):
+        super().__init__(name)
+        self._parent, self.nodeX, self.nodeY, self.path = parent, 0, 0, f'/project1/{name}'
+        self.inputConnectors, self.outputConnectors = [FakeConnector(self)], [FakeConnector(self)]
+        if parent is not None:
+            parent._children[name] = self
+
+    def parent(self):
+        return self._parent
+
+    def create(self, _type, name):
+        return WiredOp(name, self)
+
+    def destroy(self):
+        for c in self.inputConnectors + self.outputConnectors:
+            for o in c.connections:
+                o.connections.remove(c)
+            c.connections = []
+        self._parent._children.pop(self.name, None)
+        self.valid = False
+
+
+class ExtBakeTests(unittest.TestCase):
+    def test_rebake_keeps_position_and_wires(self):
+        """2.2.2: Bake replaced an existing <name>_baked node with an unwired one at the default position."""
+        mod = import_ext()
+        net = WiredOp('project1')
+        owner = WiredOp('PluginBuilder', net)
+        page = owner.appendCustomPage('Builder')
+        owner._pars['Pluginname'] = FakePar('Pluginname', 'Str', page)
+        owner.par.Pluginname.val = 'FFT'
+        loader = WiredOp('plugin_loader', owner)
+        loader.appendCustomPage('Spectrum').appendFloat('Gain', label='Gain')
+        ext = make_ext(mod, owner)
+        ext.plugins_dir = '__Plugins__'                                      # set by __init__, which make_ext skips
+        ext.bake_plugin()
+        baked = net.op('FFT_baked')
+        self.assertIsNotNone(baked)
+        self.assertEqual(baked.par.plugin, '__Plugins__/FFT/FFT.dll')      # project-relative (2.2.1)
+        src, dst = WiredOp('audio', net), WiredOp('viz', net)
+        src.outputConnectors[0].connect(baked.inputConnectors[0])
+        baked.outputConnectors[0].connect(dst.inputConnectors[0])
+        baked.nodeX, baked.nodeY = 777, -333
+        ext.bake_plugin()                                                     # re-bake
+        rebaked = net.op('FFT_baked')
+        self.assertIsNot(rebaked, baked)
+        self.assertEqual((rebaked.nodeX, rebaked.nodeY), (777, -333))
+        self.assertEqual([c.op for c in rebaked.inputConnectors[0].connections], [src])
+        self.assertEqual([c.op for c in rebaked.outputConnectors[0].connections], [dst])
+
+
 if __name__ == '__main__':
     unittest.main()

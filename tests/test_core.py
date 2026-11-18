@@ -353,6 +353,20 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(done, 'the killed job never reported done')
         self.assertTrue(gone, 'the grandchild process survived Cancel')
 
+    def test_cancel_pending_also_cancels_a_job_already_taken_from_the_queue(self):
+        """2.2.2: a job the worker has dequeued but not started yet must not escape Cancel."""
+        runner = core.BuildRunner(lambda: dict(os.environ), capture_output=True, use_job_object=False)  # not started
+        j1 = runner.submit(core.BuildJob('build', ['x'], os.getcwd()))
+        j2 = runner.submit(core.BuildJob('build', ['y'], os.getcwd()))
+        self.assertIs(runner._jobs.get_nowait(), j1)          # what the worker's _jobs.get() does
+        self.assertEqual(runner.cancel_pending(), 2)
+        self.assertTrue(j1.cancelled and j2.cancelled)
+        self.assertEqual(sorted(ev[1].id for ev in runner.poll() if ev[0] == 'done'), sorted([j1.id, j2.id]))
+        self.assertEqual(runner.pending_kinds(), [])
+        runner._jobs.put(None)                                 # a shutdown sentinel survives a cancel
+        runner.cancel_pending()
+        self.assertIsNone(runner._jobs.get_nowait())
+
     def test_env_failure_is_reported(self):
         """env_factory raising (e.g. missing vcvarsall) emits ('env', False, msg) as the first event."""
         def bad():

@@ -982,11 +982,21 @@ class PluginBuilderExt:
         parent = self.ownerComp.parent()
         name = f"{self.Pluginname}_baked"
         try:
+            # 2.2.2: a re-bake keeps the previous baked node's place in the network - its position and every
+            # wire in and out (the same connector calls _recreate_loader_node uses). It used to be destroyed
+            # and recreated unwired, silently disconnecting the show from the plugin.
             old = parent.op(name)
+            pos, wires_in, wires_out = None, [], []
             if old is not None:
+                pos = (old.nodeX, old.nodeY)
+                try:
+                    wires_in = [(i, src) for i, c in enumerate(old.inputConnectors) for src in list(c.connections)]
+                    wires_out = [(i, dst) for i, c in enumerate(old.outputConnectors) for dst in list(c.connections)]
+                except Exception as e:  # noqa: BLE001
+                    self._debug('Bake', f'could not read the previous node\'s wires: {e}')
                 old.destroy()
             node = parent.create(type(loader), name)
-            node.nodeX, node.nodeY = self.ownerComp.nodeX + 200, self.ownerComp.nodeY - 150
+            node.nodeX, node.nodeY = pos if pos else (self.ownerComp.nodeX + 200, self.ownerComp.nodeY - 150)
             # 2.2.1: project-relative, like plugin_loader. The absolute path that was written here broke the
             # baked node as soon as the .toe moved to another folder or machine (TD resolves a relative path
             # against project.folder).
@@ -1005,10 +1015,23 @@ class PluginBuilderExt:
                 except Exception:  # noqa: BLE001
                     pass
             node.cook(force=True)
+            rewired = 0
+            for i, src in wires_in:
+                try:
+                    src.connect(node.inputConnectors[i])
+                    rewired += 1
+                except Exception as e:  # noqa: BLE001
+                    self._debug('Bake', f'dropped input wire {i}: {e}')
+            for i, dst in wires_out:
+                try:
+                    node.outputConnectors[i].connect(dst)
+                    rewired += 1
+                except Exception as e:  # noqa: BLE001
+                    self._debug('Bake', f'dropped output wire {i}: {e}')
         except Exception as e:  # noqa: BLE001
             self._set_error(f"Bake failed: {e}")
             return
-        self._log('Bake', f"Created {node.path} ({copied} parameter value(s) copied as constants, DLL {dll})")
+        self._log('Bake', f"Created {node.path} ({copied} parameter value(s) copied as constants, {rewired} wire(s) restored, DLL {dll})")
         self._set_status(f'Baked → {node.name}')
 
     def RefreshDats(self):
